@@ -29,6 +29,20 @@ pub const SKIP_HEADER: &str = "x-mcp-hub-skip";
 /// of its own to go by.
 pub const CLIENT_HEADER: &str = "x-mcp-hub-client";
 
+/// Request header naming the agent session behind `mcp-hub connect`, which gets its own copy
+/// of the `perAgent` servers. See [`crate::connect::session_id`].
+pub const SESSION_HEADER: &str = "x-mcp-hub-session";
+
+/// The session an agent names in its request's headers, if it is one `mcp-hub connect` makes.
+pub fn session(headers: &hyper::HeaderMap) -> Option<String> {
+    let value = headers.get(SESSION_HEADER)?.to_str().ok()?;
+    let usable = (1..=80).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    usable.then(|| value.to_owned())
+}
+
 /// What a request says about the client that sent it.
 #[derive(Default)]
 struct Client {
@@ -36,6 +50,8 @@ struct Client {
     skip: Vec<String>,
     /// What the agent calls itself, as "claude-code/2.1.0".
     name: Option<String>,
+    /// Its session, for the servers that give each one a copy of its own.
+    session: Option<String>,
 }
 
 impl Client {
@@ -49,6 +65,7 @@ impl Client {
         Self {
             skip: skipped(&http.headers),
             name: name.map(|name| name.chars().take(80).collect()),
+            session: session(&http.headers),
         }
     }
 
@@ -402,6 +419,13 @@ impl Hub {
         text
     }
 
+    /// The agent in `session` is done: stop its copies of the `perAgent` servers.
+    pub fn end_session(&self, session: &str) {
+        for upstream in self.upstreams.iter() {
+            upstream.end_session(session);
+        }
+    }
+
     fn route(&self, name: &str) -> Option<(&Arc<Upstream>, String)> {
         let (server, tool) = name.split_once(SEP)?;
         let upstream = self.upstreams.iter().find(|u| u.name() == server)?;
@@ -506,7 +530,8 @@ impl ServerHandler for Hub {
             ("skipped", None, Ok(note(text)))
         } else {
             request.name = tool.clone().into();
-            match upstream.call_tool(request, context.ct).await {
+            let session = client.session.as_deref();
+            match upstream.call_tool_for(request, session, context.ct).await {
                 Ok(CallToolResponse::Complete(mut result)) => {
                     (cut, compacted) = self.shrink(upstream, &tool, &mut result);
                     let outcome = match result.is_error {

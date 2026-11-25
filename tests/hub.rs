@@ -978,3 +978,100 @@ async fn says_when_nothing_listens() {
         )
     );
 }
+
+/// A `perAgent` server through `mcp-hub connect`: a copy per agent session, stopped when the
+/// session ends.
+#[tokio::test]
+async fn gives_each_connected_agent_its_own_copy() {
+    let log = std::env::temp_dir().join(format!("mcp-hub-hub-per-agent-{}", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let config = parse_config(
+        &json!({"servers": {"local": {
+            "command": "/bin/sh",
+            "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stdio-server.sh")],
+            "env": {"START_LOG": log},
+            "perAgent": true,
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let upstream = Upstream::new(config.servers[0].clone(), store.clone());
+    let hub = Hub::new(vec![upstream.clone()]);
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
+    let pids = || -> Vec<String> {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        text.lines().map(str::to_owned).collect()
+    };
+    let running = |pid: &str| {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+
+    let mut agents = Vec::new();
+    for _ in 0..2 {
+        let (agent, bridge) = tokio::io::duplex(1 << 16);
+        let (input, output) = tokio::io::split(bridge);
+        let bridge = tokio::spawn(mcp_hub::connect::run(
+            port,
+            store.clone(),
+            Vec::new(),
+            input,
+            output,
+        ));
+        let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+        assert_eq!(client.list_all_tools().await.unwrap().len(), 2);
+        for _ in 0..2 {
+            let result = client
+                .call_tool(CallToolRequestParams::new("local__env"))
+                .await
+                .unwrap();
+            assert!(result.is_error != Some(true), "{result:?}");
+        }
+        agents.push((client, bridge));
+    }
+    // One process to list the tools, then one per agent.
+    assert_eq!(pids().len(), 3);
+    assert_eq!(upstream.copies(), 2);
+
+    // A request without a session (an agent set up with `headers`) is told why it gets nothing.
+    let body = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .bearer_auth(TOKEN)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"local__env"}}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("mcp-hub connect"), "{body}");
+
+    // The first agent closes its session: the bridge tells the hub, which stops its copy.
+    let (client, bridge) = agents.remove(0);
+    client.cancel().await.unwrap();
+    bridge.await.unwrap().unwrap();
+    let first = pids()[1].clone();
+    for _ in 0..40 {
+        if !running(&first) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!running(&first), "the closed session's copy still runs");
+    assert!(running(&pids()[2]));
+    assert_eq!(upstream.copies(), 1);
+
+    upstream.close().await;
+    assert!(!running(&pids()[2]));
+    let _ = std::fs::remove_file(&log);
+}

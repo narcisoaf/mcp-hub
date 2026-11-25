@@ -39,6 +39,9 @@ type Body = BoxBody<Bytes, Infallible>;
 pub const RELOAD_PATH: &str = "/reload-token";
 /// POST here, and the hub answers how each server is, as [`ServerStatus`]es.
 pub const STATUS_PATH: &str = "/status";
+/// POST here with a session header ([`crate::hub::SESSION_HEADER`]) when the agent is done:
+/// the hub stops that session's copies of the `perAgent` servers.
+pub const END_SESSION_PATH: &str = "/end-session";
 /// On every answer: changes whenever the tools the agent gets change.
 pub const TOOLS_HEADER: &str = "x-mcp-hub-tools";
 /// On an answer while some servers have yet to say what tools they have: how many.
@@ -90,7 +93,8 @@ impl Endpoint {
         }
         let reload = req.uri().path() == RELOAD_PATH && self.store.is_some();
         let status = req.uri().path() == STATUS_PATH;
-        if req.uri().path() != "/mcp" && !reload && !status {
+        let end_session = req.uri().path() == END_SESSION_PATH;
+        if req.uri().path() != "/mcp" && !reload && !status && !end_session {
             return reject(StatusCode::NOT_FOUND, "not found");
         }
         let auth = req
@@ -107,6 +111,15 @@ impl Endpoint {
         }
         if reload {
             return self.reload().await;
+        }
+        if end_session {
+            let Some(session) = crate::hub::session(req.headers()) else {
+                return reject(StatusCode::BAD_REQUEST, "no usable session header");
+            };
+            self.hub.end_session(&session);
+            let mut res = Response::new(Full::new(Bytes::new()).boxed());
+            *res.status_mut() = StatusCode::NO_CONTENT;
+            return res;
         }
         if status {
             let servers = self.hub.status().await.into_iter();

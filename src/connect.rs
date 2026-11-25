@@ -21,8 +21,8 @@ use tokio::task::AbortHandle;
 
 use crate::TOKEN_KEY;
 use crate::config::Config;
-use crate::http::{PENDING_HEADER, TOOLS_HEADER};
-use crate::hub::{CLIENT_HEADER, SKIP_HEADER, TOOLS_META};
+use crate::http::{END_SESSION_PATH, PENDING_HEADER, TOOLS_HEADER};
+use crate::hub::{CLIENT_HEADER, SESSION_HEADER, SKIP_HEADER, TOOLS_META};
 use crate::secrets::SecretStore;
 
 /// Sent on requests after `initialize`, as an HTTP client would.
@@ -55,6 +55,35 @@ pub fn env_is_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
+/// Which pid namespace this process is in, so that the hub knows whether it can check on a
+/// process by its pid: a number on Linux, "0" elsewhere.
+pub fn pid_namespace() -> &'static str {
+    static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        // "pid:[4026531836]"
+        let link = std::fs::read_link("/proc/self/ns/pid").unwrap_or_default();
+        let digits: String = link
+            .to_string_lossy()
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            "0".into()
+        } else {
+            digits
+        }
+    })
+}
+
+/// A name for this agent session, as "<pid>.<pid namespace>.<random>": the hub gives it its
+/// own copies of the `perAgent` servers, and stops them once this process is gone.
+pub fn session_id() -> String {
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut bytes);
+    let random: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}.{}.{random}", std::process::id(), pid_namespace())
+}
+
 /// The HTTP headers an agent has to send to the hub: the token, and the servers to `skip`.
 pub async fn headers(store: &SecretStore, skip: &[String]) -> Result<Vec<(&'static str, String)>> {
     let mut headers = vec![("Authorization", format!("Bearer {}", token(store).await?))];
@@ -66,6 +95,8 @@ pub async fn headers(store: &SecretStore, skip: &[String]) -> Result<Vec<(&'stat
 
 struct Bridge<W> {
     url: String,
+    /// See [`session_id`].
+    session: String,
     http: reqwest::Client,
     store: SecretStore,
     skip: Vec<String>,
@@ -134,6 +165,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             if let Some(agent) = self.agent.lock().unwrap().as_ref() {
                 request = request.header(CLIENT_HEADER, agent);
             }
+            request = request.header(SESSION_HEADER, &self.session);
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(e) if e.is_connect() && tries < HUB_DOWN_TRIES => {
@@ -270,6 +302,41 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
     }
 }
 
+impl<W> Bridge<W> {
+    /// Tell the hub that this session is over, so that it stops the session's copies of the
+    /// `perAgent` servers now. Without this it notices within seconds that the process is gone.
+    async fn end(&self, port: u16) {
+        let url = format!("http://127.0.0.1:{port}{END_SESSION_PATH}");
+        let mut request = self.http.post(url).header(SESSION_HEADER, &self.session);
+        for (name, value) in self.headers.lock().unwrap().iter() {
+            request = request.header(*name, value);
+        }
+        let sent = tokio::time::timeout(Duration::from_secs(2), request.send()).await;
+        if let Ok(Err(e)) = sent {
+            tracing::debug!("could not tell the hub the session ended: {e}");
+        }
+    }
+}
+
+/// Until the agent stops this process: SIGTERM or SIGHUP. Never elsewhere.
+async fn stopped() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut term), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = hangup.recv() => {}
+            }
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// The data of the last event in a server-sent event stream: the answer to the request.
 fn last_event(body: &[u8]) -> Option<Vec<u8>> {
     String::from_utf8_lossy(body)
@@ -282,7 +349,8 @@ fn last_event(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Forward MCP messages read from `input`, one JSON object per line, to the hub on `port`
 /// and write its answers to `output`, asking the hub to leave out the servers in `skip`.
-/// Returns when `input` ends.
+/// Returns when `input` ends, or this process is told to stop: then the hub is told that
+/// the session is over.
 pub async fn run<R, W>(
     port: u16,
     store: SecretStore,
@@ -296,6 +364,7 @@ where
 {
     let bridge = Arc::new(Bridge {
         url: format!("http://127.0.0.1:{port}/mcp"),
+        session: session_id(),
         // No proxy for loopback, whatever the environment says, and no kept connections:
         // a new one costs nothing here, and a kept one can stall on a delayed ACK.
         http: reqwest::Client::builder()
@@ -313,7 +382,14 @@ where
         polling: AtomicBool::new(false),
     });
     let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next_line().await? {
+    let stop = stopped();
+    tokio::pin!(stop);
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            _ = &mut stop => break,
+        };
+        let Some(line) = line? else { break };
         if line.trim().is_empty() {
             continue;
         }
@@ -364,5 +440,6 @@ where
     for (_, task) in bridge.running.lock().unwrap().drain() {
         task.abort();
     }
+    bridge.end(port).await;
     Ok(())
 }

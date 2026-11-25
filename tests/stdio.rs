@@ -378,3 +378,158 @@ async fn stops_a_server_that_uses_too_much_memory() {
     assert_eq!(log.starts(), 2);
     local.close().await;
 }
+
+async fn call_for(upstream: &Upstream, tool: &str, session: &str) -> Result<String, UpstreamError> {
+    let response = upstream
+        .call_tool_for(
+            CallToolRequestParams::new(tool.to_owned()),
+            Some(session),
+            CancellationToken::new(),
+        )
+        .await?;
+    let CallToolResponse::Complete(result) = response else {
+        panic!("expected a complete result")
+    };
+    Ok(result.content[0].as_text().unwrap().text.clone())
+}
+
+/// Wait up to two seconds for `done`.
+async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..40 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    done()
+}
+
+fn per_agent(log: &StartLog, more: serde_json::Value) -> Arc<Upstream> {
+    let mut server = json!({
+        "command": "/bin/sh",
+        "args": [fixtures().join("stdio-server.sh")],
+        "env": {"START_LOG": log.0},
+        "perAgent": true,
+    });
+    server
+        .as_object_mut()
+        .unwrap()
+        .extend(more.as_object().unwrap().clone());
+    upstream_with(
+        server,
+        &SecretStore::memory(),
+        Timings {
+            agent_check: Duration::from_millis(100),
+            ..Timings::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn gives_each_agent_its_own_copy() {
+    let log = StartLog::new("per-agent");
+    let local = per_agent(&log, json!({}));
+
+    // Listing starts the server once, to learn its tools, and stops it again.
+    assert_eq!(local.tools().await.unwrap().len(), 2);
+    assert_eq!(log.starts(), 1);
+    assert!(
+        eventually(|| !log.running()).await,
+        "still running after listing"
+    );
+
+    // Each session gets a process of its own, which it keeps.
+    assert!(call_for(&local, "env", "1.0.a").await.is_ok());
+    assert!(call_for(&local, "env", "1.0.b").await.is_ok());
+    assert!(call_for(&local, "env", "1.0.a").await.is_ok());
+    assert_eq!(log.starts(), 3);
+    assert!(log.nth_running(1) && log.nth_running(2));
+    assert_eq!(local.copies(), 2);
+
+    // Without a session there is nothing to call.
+    let err = call_text(&local, "env").await.unwrap_err();
+    assert!(err.to_string().contains("mcp-hub connect"), "{err}");
+
+    // A session that ends stops its copy, and only its own.
+    local.end_session("1.0.a");
+    assert!(
+        eventually(|| !log.nth_running(1)).await,
+        "a's copy still runs"
+    );
+    assert!(log.nth_running(2));
+    assert_eq!(local.copies(), 1);
+
+    // A copy that crashes is started again for the same session.
+    assert!(call_for(&local, "crash", "1.0.b").await.is_err());
+    assert!(call_for(&local, "env", "1.0.b").await.is_ok());
+    assert_eq!(log.starts(), 4);
+
+    local.close().await;
+    assert!(!log.nth_running(3));
+    assert_eq!(local.copies(), 0);
+}
+
+#[tokio::test]
+async fn stops_the_copy_of_an_agent_that_is_gone() {
+    let log = StartLog::new("agent-gone");
+    let local = per_agent(&log, json!({}));
+    // An agent process that will go away, in this process's pid namespace.
+    let mut agent = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let session = format!("{}.{}.x", agent.id(), mcp_hub::connect::pid_namespace());
+    assert!(call_for(&local, "env", &session).await.is_ok());
+    // One in another pid namespace cannot be checked: it is left to its idle time.
+    assert!(call_for(&local, "env", "1.999.y").await.is_ok());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(log.running());
+    assert_eq!(local.copies(), 2);
+
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    assert!(
+        eventually(|| local.copies() == 1).await,
+        "copy of a gone agent kept"
+    );
+    assert!(
+        eventually(|| !log.nth_running(0)).await,
+        "its process still runs"
+    );
+    assert!(log.nth_running(1));
+    local.close().await;
+}
+
+#[tokio::test]
+async fn copies_stop_when_idle_and_are_capped() {
+    let log = StartLog::new("copies-idle");
+    let local = per_agent(&log, json!({"idleTimeout": 1, "maxCopies": 2}));
+    assert!(call_for(&local, "env", "1.0.a").await.is_ok());
+    assert!(call_for(&local, "env", "1.0.b").await.is_ok());
+    let err = call_for(&local, "env", "1.0.c").await.unwrap_err();
+    assert!(err.to_string().contains("maxCopies"), "{err}");
+    assert_eq!(log.starts(), 2);
+
+    // Idle, both stop and are forgotten; a new session then has room.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(!log.nth_running(0) && !log.nth_running(1));
+    assert!(eventually(|| local.copies() == 0).await);
+    assert!(call_for(&local, "env", "1.0.c").await.is_ok());
+    assert_eq!(log.starts(), 3);
+    local.close().await;
+}
+
+#[tokio::test]
+async fn a_dropped_server_leaves_no_process_behind() {
+    let log = StartLog::new("dropped");
+    let children = StartLog::new("dropped-children");
+    let local = per_agent(
+        &log,
+        json!({"env": {"START_LOG": log.0, "CHILD_LOG": children.0}}),
+    );
+    assert_eq!(call_for(&local, "hog", "1.0.a").await.unwrap(), "hogging");
+    assert!(log.running() && children.running());
+    // Never closed: dropping it is enough.
+    drop(local);
+    assert!(eventually(|| !log.running() && !children.running()).await);
+}

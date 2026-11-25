@@ -253,6 +253,9 @@ pub struct Timings {
     pub ping_timeout: Duration,
     /// How often the memory of a command server with `maxMemoryMb` is measured.
     pub memory_check: Duration,
+    /// How often a `perAgent` server checks for copies to end: those of agents that are gone,
+    /// and those that stopped by themselves or for being idle.
+    pub agent_check: Duration,
 }
 
 impl Default for Timings {
@@ -264,6 +267,7 @@ impl Default for Timings {
             call_timeout: Duration::from_secs(300),
             ping_timeout: Duration::from_secs(5),
             memory_check: Duration::from_secs(15),
+            agent_check: Duration::from_secs(15),
         }
     }
 }
@@ -322,6 +326,46 @@ pub struct Upstream {
     generation: AtomicU64,
     /// The file the tool list is saved to, if it is.
     saved_in: std::sync::OnceLock<PathBuf>,
+    /// For a `perAgent` server: the copy each agent session has, by session.
+    copies: Option<std::sync::Mutex<HashMap<String, Arc<Upstream>>>>,
+    /// Set while the task that ends copies runs, so that there is only one.
+    sweeping: AtomicBool,
+    /// For a copy: the server it is a copy of, which keeps the tool list for all of them.
+    parent: Weak<Upstream>,
+    /// For a copy: the agent session it is for.
+    session: Option<String>,
+    /// For a copy: calls that hold it, so that it is not ended between being found and used.
+    holders: AtomicUsize,
+}
+
+/// A copy of a `perAgent` server lent to one call.
+struct Held(Arc<Upstream>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.holders.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether the agent session `session` (as [`crate::connect`] makes them, "<pid>.<pid
+/// namespace>.<random>") may still be there. Only a process in the hub's own pid namespace
+/// can be checked; for any other the answer is yes, and its copy is ended by its idle time.
+fn agent_alive(session: &str) -> bool {
+    let mut parts = session.split('.');
+    let (Some(pid), Some(ns)) = (parts.next(), parts.next()) else {
+        return true;
+    };
+    let Ok(pid) = pid.parse::<libc::pid_t>() else {
+        return true;
+    };
+    if pid <= 1 || ns != crate::connect::pid_namespace() {
+        return true;
+    }
+    // SAFETY: signal 0 sends nothing; it only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Marks the background refresh as over, also if it panicked.
@@ -350,6 +394,24 @@ impl Upstream {
         timings: Timings,
         stats: Stats,
     ) -> Arc<Self> {
+        Self::build(server, store, timings, stats, None)
+    }
+
+    /// An upstream, or with `copy_of` a copy of that `perAgent` server for agent `session`.
+    fn build(
+        mut server: ServerConfig,
+        store: SecretStore,
+        timings: Timings,
+        stats: Stats,
+        copy_of: Option<(Weak<Upstream>, String)>,
+    ) -> Arc<Self> {
+        let copies = server.per_agent().filter(|_| copy_of.is_none());
+        if copy_of.is_some()
+            && let Endpoint::Stdio(stdio) = &mut server.endpoint
+        {
+            stdio.per_agent = None;
+        }
+        let (parent, session) = copy_of.unzip();
         Arc::new_cyclic(|me| Self {
             server,
             store,
@@ -367,6 +429,11 @@ impl Upstream {
             refresh_again: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             saved_in: std::sync::OnceLock::new(),
+            copies: copies.map(|_| std::sync::Mutex::new(HashMap::new())),
+            sweeping: AtomicBool::new(false),
+            parent: parent.unwrap_or_default(),
+            session,
+            holders: AtomicUsize::new(0),
         })
     }
 
@@ -630,13 +697,21 @@ impl Upstream {
         match connected {
             Ok((service, pid)) => {
                 match pid {
+                    Some(pid) if self.session.is_some() => {
+                        tracing::info!("[{}] started for an agent, pid {pid}", self.name())
+                    }
                     Some(pid) => tracing::info!("[{}] started, pid {pid}", self.name()),
                     None => tracing::debug!("[{}] connected", self.name()),
                 }
                 let ms = started.elapsed().as_millis() as u64;
                 self.stats.record(
                     "connect",
-                    serde_json::json!({"server": self.name(), "pid": pid, "ms": ms}),
+                    serde_json::json!({
+                        "server": self.name(),
+                        "pid": pid,
+                        "ms": ms,
+                        "agent": self.session,
+                    }),
                 );
                 let id = self.connections.fetch_add(1, Ordering::Relaxed);
                 let since = Instant::now();
@@ -685,6 +760,7 @@ impl Upstream {
                 "server": self.name(),
                 "why": why,
                 "upSeconds": conn.since.elapsed().as_secs(),
+                "agent": self.session,
             }),
         );
     }
@@ -778,24 +854,21 @@ impl Upstream {
                             "toolsCut": (!listed.full.is_empty()).then_some(listed.full.len()),
                         }),
                     );
-                    let mut cached = CachedTools {
+                    let cached = CachedTools {
                         tools: Arc::new(listed.tools),
                         full: Arc::new(listed.full),
                         fetched: Instant::now(),
                         saved: false,
                         generation: 0,
                     };
-                    let mut cache = self.cache.lock().unwrap();
-                    let changed = cache
-                        .as_ref()
-                        .is_none_or(|old| old.tools != cached.tools || old.full != cached.full);
-                    cached.generation = if changed {
-                        self.save_tools(&cached);
-                        self.generation.fetch_add(1, Ordering::AcqRel) + 1
-                    } else {
-                        self.generation.load(Ordering::Acquire)
-                    };
-                    *cache = Some(cached);
+                    // A copy's list is its server's, which lists it for all copies.
+                    let parent = self.parent.upgrade();
+                    parent.as_deref().unwrap_or(self).cache_tools(cached);
+                    if self.copies.is_some() {
+                        // Started only to list its tools: tool calls go to the copies.
+                        drop(lease);
+                        self.reset_current("listed").await;
+                    }
                     return Ok(tools);
                 }
                 Ok(Err(ServiceError::McpError(e))) => UpstreamError::Mcp(e),
@@ -817,6 +890,30 @@ impl Upstream {
             return Err(error);
         }
         unreachable!()
+    }
+
+    /// Keep `cached` as the tool list, and save it if it changed.
+    fn cache_tools(&self, mut cached: CachedTools) {
+        let mut cache = self.cache.lock().unwrap();
+        let changed = cache
+            .as_ref()
+            .is_none_or(|old| old.tools != cached.tools || old.full != cached.full);
+        cached.generation = if changed {
+            self.save_tools(&cached);
+            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            self.generation.load(Ordering::Acquire)
+        };
+        *cache = Some(cached);
+    }
+
+    /// Give up the current connection, whichever it is: see [`Upstream::reset`].
+    async fn reset_current(&self, why: &str) {
+        let mut slot = self.conn.lock().await;
+        if let Some(conn) = slot.take() {
+            self.stopped(&conn, why);
+            tokio::spawn(conn.close());
+        }
     }
 
     /// The tools under their hub names, for the hub's own tools/list, from the cache.
@@ -841,7 +938,9 @@ impl Upstream {
         if let Some(tools) = found {
             // Not if that would start a process that was stopped for being idle: its list is
             // fetched again whenever it starts.
-            if old && (self.server.idle_timeout.is_none() || self.connected()) {
+            // A `perAgent` server is not kept running: its copies refresh the list as they start.
+            let kept = self.server.idle_timeout.is_none() && self.copies.is_none();
+            if old && (kept || self.connected()) {
                 self.refresh();
             }
             return (Some(tools), generation);
@@ -902,6 +1001,159 @@ impl Upstream {
         params: CallToolRequestParams,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
+        self.call_tool_for(params, None, cancel).await
+    }
+
+    /// [`Upstream::call_tool`] for the agent in `session`: a `perAgent` server passes it to
+    /// that session's copy, started now if it has none.
+    pub async fn call_tool_for(
+        &self,
+        params: CallToolRequestParams,
+        session: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<CallToolResponse, UpstreamError> {
+        if self.copies.is_none() {
+            return self.call_own(params, cancel).await;
+        }
+        let Some(session) = session else {
+            return Err(UpstreamError::Other(format!(
+                "{} gives every agent session a copy of its own, and this agent did not say \
+                 which session it is in: connect it with \"mcp-hub connect\"",
+                self.name()
+            )));
+        };
+        let copy = self.copy_for(session)?;
+        copy.0.call_own(params, cancel).await
+    }
+
+    /// The copy of this `perAgent` server for `session`, made now if there is none.
+    fn copy_for(&self, session: &str) -> Result<Held, UpstreamError> {
+        let Some(copies) = &self.copies else {
+            unreachable!("only a perAgent server has copies")
+        };
+        let max = self.server.per_agent().unwrap_or(1);
+        let mut copies = copies.lock().unwrap();
+        let held = |copy: &Arc<Upstream>| {
+            copy.holders.fetch_add(1, Ordering::AcqRel);
+            Held(copy.clone())
+        };
+        if let Some(copy) = copies.get(session) {
+            return Ok(held(copy));
+        }
+        if copies.len() >= max {
+            // Copies that stopped hold no process: they make room first.
+            let stopped: Vec<_> = copies
+                .iter()
+                .filter(|(_, copy)| copy.ended())
+                .map(|(session, _)| session.clone())
+                .collect();
+            for session in stopped {
+                if let Some(copy) = copies.remove(&session) {
+                    tokio::spawn(async move { copy.close_because("idle").await });
+                }
+            }
+        }
+        if copies.len() >= max {
+            return Err(UpstreamError::Other(format!(
+                "{} already runs for {} other agent sessions, as many as its maxCopies: \
+                 try again once one of them is done with it",
+                self.name(),
+                copies.len()
+            )));
+        }
+        let copy = Self::build(
+            self.server.clone(),
+            self.store.clone(),
+            self.timings.clone(),
+            self.stats.clone(),
+            Some((self.me.clone(), session.to_owned())),
+        );
+        let lent = held(&copy);
+        copies.insert(session.to_owned(), copy);
+        drop(copies);
+        self.sweep();
+        Ok(lent)
+    }
+
+    /// Whether this copy can go: no call holds it and it has no process running. Not while
+    /// it is starting one (the connection is locked then).
+    fn ended(&self) -> bool {
+        if self.holders.load(Ordering::Acquire) > 0 || self.busy.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        self.conn
+            .try_lock()
+            .is_ok_and(|slot| slot.as_ref().is_none_or(|c| c.service.is_closed()))
+    }
+
+    /// End the copies of agents that are gone and those that stopped, every
+    /// [`Timings::agent_check`] for as long as there are copies.
+    fn sweep(&self) {
+        if self.sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.me.clone();
+        let every = self.timings.agent_check;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(upstream) = me.upgrade() else { return };
+                let Some(copies) = &upstream.copies else {
+                    return;
+                };
+                let mut ending = Vec::new();
+                {
+                    let mut copies = copies.lock().unwrap();
+                    copies.retain(|session, copy| {
+                        let why = if !agent_alive(session) {
+                            "agent gone"
+                        } else if copy.ended() {
+                            "idle"
+                        } else {
+                            return true;
+                        };
+                        ending.push((copy.clone(), why));
+                        false
+                    });
+                    if copies.is_empty() {
+                        // Under the lock: a copy made after this starts the task again.
+                        upstream.sweeping.store(false, Ordering::Release);
+                    }
+                }
+                let done = upstream.sweeping.load(Ordering::Acquire);
+                for (copy, why) in ending {
+                    if why == "agent gone" {
+                        tracing::info!("[{}] its agent is gone: stopping its copy", copy.name());
+                    }
+                    tokio::spawn(async move { copy.close_because(why).await });
+                }
+                if !done {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The agent in `session` is done: stop its copy of this server, if it has one.
+    pub fn end_session(&self, session: &str) {
+        let Some(copies) = &self.copies else { return };
+        if let Some(copy) = copies.lock().unwrap().remove(session) {
+            tokio::spawn(async move { copy.close_because("agent done").await });
+        }
+    }
+
+    /// How many agent sessions have a copy of this server now.
+    pub fn copies(&self) -> usize {
+        self.copies
+            .as_ref()
+            .map_or(0, |copies| copies.lock().unwrap().len())
+    }
+
+    async fn call_own(
+        &self,
+        params: CallToolRequestParams,
+        cancel: CancellationToken,
+    ) -> Result<CallToolResponse, UpstreamError> {
         let lease = self.lease(true).await?;
         if lease.fresh {
             // The server just (re)started, maybe as another version: ask for its tools again.
@@ -949,12 +1201,40 @@ impl Upstream {
         });
     }
 
-    /// Disconnect; a command server is asked to exit, then killed if it does not.
+    /// Disconnect; a command server is asked to exit, then killed if it does not. So are
+    /// the copies of a `perAgent` server.
     pub async fn close(&self) {
+        let copies = self.copies.as_ref().map(|copies| {
+            let mut copies = copies.lock().unwrap();
+            copies.drain().map(|(_, copy)| copy).collect::<Vec<_>>()
+        });
+        let copies = copies.unwrap_or_default();
+        let closing = copies.iter().map(|copy| copy.close_because("shutdown"));
+        futures::future::join(
+            futures::future::join_all(closing),
+            self.close_because("shutdown"),
+        )
+        .await;
+    }
+
+    async fn close_because(&self, why: &str) {
         let conn = self.conn.lock().await.take();
         if let Some(conn) = conn {
-            self.stopped(&conn, "shutdown");
+            self.stopped(&conn, why);
             conn.close_within(Some(CLOSE_TIMEOUT)).await;
+        }
+    }
+}
+
+impl Drop for Upstream {
+    /// Whatever ends an upstream without closing it first, its server's processes do not
+    /// outlive it.
+    fn drop(&mut self) {
+        if let Some(pid) = self.conn.get_mut().as_ref().and_then(|c| c.pid)
+            && pid > 1
+        {
+            // SAFETY: as in `Conn::close_within`: the group is the server's own.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
         }
     }
 }

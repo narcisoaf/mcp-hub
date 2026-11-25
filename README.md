@@ -338,6 +338,10 @@ an agent works, with a `description` added:
   call before the hub stops it. 600 (10 minutes) by default, `0` to never stop it.
 - `maxMemoryMb`: optional; stop the server when it uses more memory than this,
   e.g. `"maxMemoryMb": 1024`. No limit by default.
+- `perAgent`: optional, `true` to give every agent session a copy of its own,
+  for a server that keeps state between calls (a browser's open pages, a
+  debugger's session) that two agents must not share. `maxCopies` (4 by
+  default) is how many may run at once. See "One copy per agent" below.
 
 **`PATH` is minimal.** The service does not load your shell profile, so it
 typically sees only system directories such as `/usr/bin` and `/bin`: Homebrew,
@@ -380,6 +384,38 @@ How it runs:
   printed last.
 - `oauth` and `bearer` do not apply; servers that need a login of their own
   usually keep it in their own files.
+
+#### One copy per agent
+
+Normally one process serves every agent. With `"perAgent": true` each agent
+session gets its own:
+
+    "chrome-devtools": {
+      "command": "/usr/bin/node",
+      "args": ["/opt/chrome-devtools-mcp/out/Default/gen/src/bin/chrome-devtools-mcp.js", "--isolated=true", "--headless=true"],
+      "perAgent": true,
+      "maxCopies": 4,
+      "maxMemoryMb": 1500,
+      "description": "Chrome DevTools for agents: open pages, inspect, debug, measure"
+    }
+
+- A session's copy starts on its first tool call, never for listing tools: the
+  list comes from the hub's copy of it, which a short-lived process fetches
+  once (then whenever a copy starts, the list is fetched again).
+- A copy stops when its session ends (`mcp-hub connect` tells the hub as the
+  agent closes it), when the `mcp-hub connect` process is gone (checked every
+  15 seconds, for an agent that was killed), and after `idleTimeout` without a
+  tool call. The next call of the same session then starts a new copy, which
+  begins anew (no open pages).
+- With `maxCopies` copies running, a call from another session is refused with
+  an error saying so; copies that stopped do not count.
+- `idleTimeout`, `maxMemoryMb` and the unit's memory cap apply to each copy,
+  or to all together for the cap: keep `maxCopies` × what a copy may use under
+  `MemoryMax`.
+- It needs agents set up with `mcp-hub connect`, which names the session. A
+  session that has no name (an agent set up with `headers`) gets the tools
+  listed, and an error saying why on calling one.
+- Subagents of one agent share its MCP connection, hence its copy.
 
 ## Day to day
 

@@ -48,6 +48,10 @@ const DEFAULT_MAX_RESULT: usize = 40_000;
 /// cost an agent thousands of tokens each time it loads the tool.
 const DEFAULT_MAX_DESCRIPTION: usize = 2000;
 
+/// How many agents may have their own copy of a `perAgent` server at once, unless
+/// `maxCopies` says otherwise.
+const DEFAULT_MAX_COPIES: usize = 4;
+
 /// A command server nobody has called for this long is stopped, unless `idleTimeout` says otherwise.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -71,6 +75,9 @@ pub struct StdioCommand {
     pub secret_env: Vec<String>,
     /// Stop the server when it and the processes it started use more memory than this.
     pub max_memory_mb: Option<u64>,
+    /// Each agent session gets a copy of its own, up to this many at once; `None` for one
+    /// copy shared by all. For servers that keep state between calls (a browser's pages).
+    pub per_agent: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +90,16 @@ pub enum Auth {
     },
     /// A static token kept in the keyring, set with `mcp-hub set-token`.
     Bearer,
+}
+
+impl ServerConfig {
+    /// For a `perAgent` server: how many copies may run at once.
+    pub fn per_agent(&self) -> Option<usize> {
+        match &self.endpoint {
+            Endpoint::Stdio(stdio) => stdio.per_agent,
+            Endpoint::Http(_) => None,
+        }
+    }
 }
 
 impl Config {
@@ -139,6 +156,8 @@ struct RawServer {
     cwd: Option<String>,
     secret_env: Option<Vec<String>>,
     max_memory_mb: Option<u64>,
+    per_agent: Option<bool>,
+    max_copies: Option<usize>,
     /// Seconds; 0 for never.
     idle_timeout: Option<u64>,
     skip_when_env: Option<String>,
@@ -226,6 +245,12 @@ fn parse_stdio(at: &str, s: RawServer, command: String) -> Result<StdioCommand> 
             "{at}.maxMemoryMb: expected a number of megabytes above 0 (leave it out for no limit)"
         );
     }
+    let per_agent = match (s.per_agent, s.max_copies) {
+        (Some(true), Some(0)) => bail!("{at}.maxCopies: expected a number above 0"),
+        (Some(true), max) => Some(max.unwrap_or(DEFAULT_MAX_COPIES)),
+        (_, Some(_)) => bail!("{at}.maxCopies: only applies with \"perAgent\": true"),
+        (Some(false) | None, None) => None,
+    };
     Ok(StdioCommand {
         command,
         args: s.args.unwrap_or_default(),
@@ -233,6 +258,7 @@ fn parse_stdio(at: &str, s: RawServer, command: String) -> Result<StdioCommand> 
         cwd,
         secret_env,
         max_memory_mb: s.max_memory_mb,
+        per_agent,
     })
 }
 
@@ -311,9 +337,11 @@ pub fn parse_config(text: &str) -> Result<Config> {
                     || s.cwd.is_some()
                     || s.secret_env.is_some()
                     || s.max_memory_mb.is_some()
+                    || s.per_agent.is_some()
+                    || s.max_copies.is_some()
                 {
                     bail!(
-                        "{at}: args, env, cwd, secretEnv and maxMemoryMb only apply to command servers"
+                        "{at}: args, env, cwd, secretEnv, maxMemoryMb, perAgent and maxCopies only apply to command servers"
                     );
                 }
                 let url = Url::parse(&url).with_context(|| format!("{at}.url"))?;
@@ -401,6 +429,7 @@ mod tests {
                 cwd: Some("/home/me/p".into()),
                 secret_env: vec!["API_TOKEN".into()],
                 max_memory_mb: Some(512),
+                per_agent: None,
             })
         );
         assert!(
@@ -422,6 +451,23 @@ mod tests {
             c.servers.iter().map(|s| s.idle_timeout).collect::<Vec<_>>(),
             [secs(600), secs(30), None, None, secs(120)]
         );
+    }
+
+    #[test]
+    fn per_agent() {
+        let c = parse_config(
+            r#"{"servers":{
+                "a":{"command":"x"},"b":{"command":"x","perAgent":true},
+                "c":{"command":"x","perAgent":true,"maxCopies":2},"d":{"command":"x","perAgent":false}
+            }}"#,
+        )
+        .unwrap();
+        let copies = |s: &ServerConfig| match &s.endpoint {
+            Endpoint::Stdio(stdio) => stdio.per_agent,
+            Endpoint::Http(_) => unreachable!(),
+        };
+        let got: Vec<_> = c.servers.iter().map(copies).collect();
+        assert_eq!(got, [None, Some(DEFAULT_MAX_COPIES), Some(2), None]);
     }
 
     #[test]
@@ -591,6 +637,18 @@ mod tests {
             (
                 r#"{"servers":{"a":{"url":"https://x/","compactResults":"yes"}}}"#,
                 "compactResults not a boolean",
+            ),
+            (
+                r#"{"servers":{"a":{"url":"https://x/","perAgent":true}}}"#,
+                "perAgent on a url server",
+            ),
+            (
+                r#"{"servers":{"a":{"command":"x","maxCopies":2}}}"#,
+                "maxCopies without perAgent",
+            ),
+            (
+                r#"{"servers":{"a":{"command":"x","perAgent":true,"maxCopies":0}}}"#,
+                "no copies at all",
             ),
             (r#"{"port":3050,"loginPort":3050}"#, "same ports"),
             (r#"{"port":80}"#, "privileged port"),
