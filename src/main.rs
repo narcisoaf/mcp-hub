@@ -212,17 +212,29 @@ fn tools(n: usize) -> &'static str {
 
 /// One server's line in `status`: its tool count, or what is wrong. `width` is that of the
 /// longest name.
-fn status_line(p: Paint, width: usize, name: &str, result: &Result<usize, String>) -> String {
+/// With the MCP version it speaks, if known.
+fn status_line(
+    p: Paint,
+    width: usize,
+    name: &str,
+    result: &Result<usize, String>,
+    protocol: Option<&str>,
+) -> String {
     if !p.on {
         // Plain, as before colors: scripts may read it.
+        let protocol = protocol.map(|v| format!(" (MCP {v})")).unwrap_or_default();
         return match result {
-            Ok(n) => format!("ok    {name}: {n} tools"),
+            Ok(n) => format!("ok    {name}: {n} tools{protocol}"),
             Err(e) => format!("FAIL  {name}: {e}"),
         };
     }
     let name = p.bold(format!("{name:width$}"));
     match result {
-        Ok(n) => format!("  {}{name}  {n:>3} {}", p.ok(""), p.dim(tools(*n))),
+        Ok(n) => {
+            let protocol = protocol.map(|v| format!("  MCP {v}")).unwrap_or_default();
+            let tools = format!("{:6}{protocol}", tools(*n));
+            format!("  {}{name}  {n:>3} {}", p.ok(""), p.dim(tools.trim_end()))
+        }
         Err(e) => format!(
             "  {}{name}  {}",
             p.fail(""),
@@ -271,7 +283,8 @@ async fn status(config: Config, store: SecretStore) -> Result<bool> {
                     (Some(tools), _) => Ok(tools),
                     (None, error) => Err(error.clone().unwrap_or_else(|| "no answer".into())),
                 };
-                println!("{}", status_line(p, width, &server.name, &result));
+                let protocol = server.protocol.as_deref();
+                println!("{}", status_line(p, width, &server.name, &result, protocol));
                 results.push(result);
             }
             let running: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
@@ -315,7 +328,9 @@ async fn status(config: Config, store: SecretStore) -> Result<bool> {
                 .await
                 .map(|tools| tools.len())
                 .map_err(|e| e.to_string());
-            println!("{}", status_line(p, width, upstream.name(), &result));
+            let protocol = upstream.protocol();
+            let line = status_line(p, width, upstream.name(), &result, protocol.as_deref());
+            println!("{line}");
             results.push(result);
             upstream.close().await;
         }

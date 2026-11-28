@@ -9,6 +9,8 @@ single connection. Tools appear as `<server>__<tool>`, e.g. `sentry__search_issu
 A single Rust binary built on the official MCP Rust SDK
 ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)). Deliberately small:
 no dashboard, no admin API, no runtime reconfiguration.
+It speaks MCP 2026-07-28 and the versions before it, to agents and to servers
+alike (see [MCP versions](#mcp-versions)).
 Stateless towards the agents, and it passes upstream results through without
 re-validating them, so memory stays flat: about 15 MB at start and about 30 MB
 with 170 tools (half a megabyte of JSON) cached, however many agents ask for
@@ -93,7 +95,9 @@ keyring:
 - `mcp-hub connect` is a small stdio MCP server that forwards everything to the
   running hub (Claude Code, Codex, Cursor, Claude Desktop). It also tells the
   agent when the hub's tools change (`notifications/tools/list_changed`), as when
-  a slow server comes up after the agent first asked.
+  a slow server comes up after the agent first asked: an agent of MCP 2026-07-28
+  on the subscription it opens for that (`subscriptions/listen`), which
+  `connect` answers itself.
 - `mcp-hub headers` prints the headers as JSON, for agents that talk HTTP and can
   run a command to get them (Claude Code also can).
 
@@ -266,10 +270,12 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
   path in every call. A call that names a folder itself keeps it. An agent set
   up with `headers` says no folder, so it gets the parameter listed as the server
   has it. Subagents share their agent's `connect`, hence its folder.
+- `skills`: optional, `true` to pass on the server's skills, if it serves some.
+  See [Skills](#skills).
 
 Then restart the hub and check it:
 
-    mcp-hub status                     # tool count per server, or what is wrong
+    mcp-hub status                     # tool count and MCP version per server, or what is wrong
 
 Agents pick up the new tools on their next session (Claude Code: `/mcp` →
 reconnect; Cursor: toggle the server in settings).
@@ -282,6 +288,60 @@ is also refreshed when a server announces that its tools changed
 (`notifications/tools/list_changed`) and whenever a local server starts. Only
 right after the hub starts are the upstreams asked directly, each for at most
 5 seconds; a slower one is left out of that first list and appears in the next.
+
+### MCP versions
+
+The hub speaks MCP 2026-07-28, the current revision, and the ones before it
+(back to 2024-11-05), to agents and to servers. `mcp-hub status` shows which
+version each server speaks.
+
+- **Servers.** The hub first asks a server which versions it speaks
+  (`server/discover`, new in 2026-07-28). One that answers with an error, or not
+  within 10 seconds, is connected to the old way (`initialize`). Which servers
+  those are is remembered, also across restarts (with their saved tool lists),
+  so that is asked once; it is asked again if connecting the old way fails.
+  Connecting the old way, the hub still offers 2026-07-28, and some servers take
+  it: Ultrapaint's relay, which cannot answer `server/discover` before it knows
+  its project, then speaks 2026-07-28 in every request.
+- **Agents.** Each picks its version. Claude Code (2.1.331) speaks 2026-07-28,
+  Codex (0.172) 2025-06-18. `mcp-hub connect` sends the HTTP headers that
+  2026-07-28 asks of a client (`MCP-Protocol-Version`, `Mcp-Method`,
+  `Mcp-Name`), taken from each message.
+- **Questions for the user.** In 2026-07-28 a tool may answer that it needs
+  input first ("input required"): a form for the user, a reply from the agent's
+  model, or its folders. The agent gets them, then calls the tool again with the
+  answers. Between an agent and a server that both speak 2026-07-28, the hub
+  passes that on, and tells the server what the agent says it can do
+  (`elicitation`, `sampling`, `roots`). Ultrapaint's `ask_user` works this way:
+  Claude Code shows its questions as a form. Agents of older versions cannot be
+  asked through the hub. Their way, a request from the server to the agent,
+  needs a session, which the hub does not keep. So the server hears that the
+  agent cannot be asked, and does without.
+- **Cache hints.** To 2026-07-28 agents, the tool list and the instructions say
+  they hold for 5 minutes (`ttlMs`, 0 while servers are still starting), and
+  only for that agent (`cacheScope: "private"`): what an agent gets depends on
+  its headers.
+- **Results** lose the server's name and version that a 2026-07-28 server puts
+  in each one (`_meta`, `io.modelcontextprotocol/serverInfo`): the agent knows
+  which tool it called.
+- **Tasks** (the extension for long calls the agent checks on later) are not
+  passed on: none of the servers this was built against offers them.
+
+### Skills
+
+A server of MCP 2026-07-28 may also serve skills (the Skills extension): files
+of instructions, each with a name and a description, that an agent loads when
+a task calls for them. Claude Code (2.1.332 on) shows them as `hub:<skill>`.
+With `"skills": true` the hub serves that server's skills as its own. It lists
+them (`skills/list`) and reads their files (`resources/read` of `skill://`
+URIs) from the server that listed them; it serves no other resources.
+
+Off unless asked for: an agent that loads skills lists every name and
+description up front, in every session, as it does tools without tool search.
+Cloudflare's 24 skills take about 5,800 characters (about 1,400 tokens). The
+hub knows that a server serves skills once it has connected to it, and
+remembers it across restarts; until then it does not offer them. A `perAgent`
+server's skills are not passed on.
 
 ### Long descriptions
 

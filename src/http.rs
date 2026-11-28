@@ -124,16 +124,18 @@ impl Endpoint {
         if status {
             let servers = self.hub.status().await.into_iter();
             let servers: Vec<_> = servers
-                .map(|(name, listed)| match listed {
+                .map(|(name, listed, protocol)| match listed {
                     Ok(tools) => ServerStatus {
                         name,
                         tools: Some(tools),
                         error: None,
+                        protocol,
                     },
                     Err(error) => ServerStatus {
                         name,
                         tools: None,
                         error: Some(error),
+                        protocol,
                     },
                 })
                 .collect();
@@ -281,6 +283,9 @@ pub struct ServerStatus {
     pub tools: Option<usize>,
     /// Why not, if it did not.
     pub error: Option<String>,
+    /// The MCP version it speaks, if it was reached. Not from hubs before 0.9.
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 /// Ask the hub on `port` how its servers are. `None` if no hub that can answer this runs

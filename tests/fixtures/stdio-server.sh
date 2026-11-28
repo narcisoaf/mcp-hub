@@ -4,6 +4,7 @@
 # Not listed: "slow" answers after 2 seconds, answering other requests meanwhile, "hang"
 # stops answering anything, "notify" says that the tool list changed, "hog" starts a process
 # that holds 30 MB for a minute and appends its pid to the file $CHILD_LOG.
+# Speaks MCP from before 2026-07-28 only.
 # With $START_LOG set, appends its pid to that file. While the file $MORE_FLAG exists, there
 # is one more tool, "more".
 [ -n "$START_LOG" ] && echo $$ >> "$START_LOG"
@@ -13,6 +14,8 @@ while IFS= read -r line; do
     case "$line" in
     *'"method":"initialize"'*)
         version=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
+        # A version newer than it knows: its own, as a server of an older version answers.
+        case "$version" in 2026-* | 2027-*) version="2025-11-25" ;; esac
         printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fake-stdio","version":"1"}}}\n' "$id" "$version"
         ;;
     *'"method":"tools/list"'*)
@@ -51,6 +54,13 @@ while IFS= read -r line; do
         ;;
     *'"method":"tools/call"'*)
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"cwd=%s secret=%s"}]}}\n' "$id" "$(pwd -P)" "$FAKE_SECRET"
+        ;;
+    *)
+        # A request it does not know, as MCP 2026-07-28's server/discover: an error, or with
+        # $IGNORE_UNKNOWN set, no answer at all.
+        if [ -n "$id" ] && [ -z "$IGNORE_UNKNOWN" ]; then
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+        fi
         ;;
     esac
 done

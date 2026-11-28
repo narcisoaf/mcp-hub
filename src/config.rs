@@ -41,6 +41,9 @@ pub struct ServerConfig {
     /// The parameter in which this server's tools take the folder the agent works in. The hub
     /// fills it in from the agent's `mcp-hub connect` and leaves it out of the tools it lists.
     pub folder_argument: Option<String>,
+    /// Pass on the server's skills (the MCP Skills extension), if it serves some. Off unless
+    /// asked for: agents that load skills list each one's name and description up front.
+    pub skills: bool,
 }
 
 /// Unless `maxResult` says otherwise: about 10,000 tokens. Agents have limits of their own,
@@ -168,6 +171,7 @@ struct RawServer {
     max_result: Option<usize>,
     compact_results: Option<bool>,
     folder_argument: Option<String>,
+    skills: Option<bool>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -316,6 +320,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
         let max_result = max_result.filter(|max| *max > 0);
         let compact_results = s.compact_results.take();
         let compact_results = compact_results.or(raw.compact_results).unwrap_or(false);
+        let skills = s.skills.take().unwrap_or(false);
         let folder_argument = s.folder_argument.take();
         if let Some(name) = &folder_argument
             && !valid_argument_name(name)
@@ -392,6 +397,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             max_result,
             compact_results,
             folder_argument,
+            skills,
         });
     }
     Ok(Config {

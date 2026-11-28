@@ -14,8 +14,9 @@ use mcp_hub::{
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListSkillsResult,
+        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        SKILLS_EXTENSION_ID, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     transport::{
@@ -38,7 +39,13 @@ struct Fake {
     wordy: bool,
     /// Also list tools that take the agent's folder as `cwd`, as Ultrapaint's relay does.
     folder: bool,
+    /// Serve one skill, "demo" (the MCP Skills extension).
+    skills: bool,
 }
+
+/// The URI of the fake's skill.
+const DEMO_SKILL: &str = "skill://demo/SKILL.md";
+const DEMO_SKILL_TEXT: &str = "---\nname: demo\ndescription: A skill for tests\n---\nDo it.\n";
 
 /// What "wordy" has to say: `about` it, over and over, and how it ends.
 fn wordy_text(about: &str) -> String {
@@ -50,7 +57,45 @@ fn wordy_text(about: &str) -> String {
 
 impl ServerHandler for Fake {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.skills {
+            capabilities.resources = Some(Default::default());
+            let skills = (SKILLS_EXTENSION_ID.to_owned(), Default::default());
+            capabilities.extensions = Some([skills].into_iter().collect());
+        }
+        ServerConfig::new(capabilities)
+    }
+
+    async fn list_skills(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(DEMO_SKILL_TEXT.as_bytes());
+        let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let skill = json!({
+            "uri": DEMO_SKILL,
+            "frontmatter": {"name": "demo", "description": "A skill for tests"},
+            "resources": [{"uri": DEMO_SKILL, "digest": format!("sha256:{digest}"),
+                "size": DEMO_SKILL_TEXT.len()}],
+        });
+        let skill = serde_json::from_value(skill).unwrap();
+        Ok(ListSkillsResult::with_all_items(vec![skill]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != DEMO_SKILL {
+            return Err(ErrorData::invalid_params("no such resource", None));
+        }
+        let contents = json!({"contents": [{"uri": DEMO_SKILL, "mimeType": "text/markdown",
+            "text": DEMO_SKILL_TEXT}]});
+        Ok(ReadResourceResponse::Complete(
+            serde_json::from_value(contents).unwrap(),
+        ))
     }
 
     async fn list_tools(
@@ -102,8 +147,45 @@ impl ServerHandler for Fake {
     async fn call_tool(
         &self,
         req: CallToolRequestParams,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if req.name == "ask" {
+            // Asks the user, with a form, if the agent can show one (MCP 2026-07-28's way).
+            if let Some(answers) = &req.input_responses {
+                let text = format!(
+                    "answered {} with state {:?}",
+                    json!(answers),
+                    req.request_state
+                );
+                return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::text(text),
+                ])));
+            }
+            let modern = context
+                .meta
+                .protocol_version()
+                .is_some_and(|v| !v.has_initialize());
+            let forms = context
+                .client_capabilities()
+                .is_some_and(|c| c.elicitation.is_some());
+            if modern && forms {
+                let asked = json!({
+                    "resultType": "input_required",
+                    "inputRequests": {"pick": {"method": "elicitation/create", "params": {
+                        "mode": "form", "message": "Which one?",
+                        "requestedSchema": {"type": "object",
+                            "properties": {"one": {"type": "string"}}}}}},
+                    "requestState": "asked-once",
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "fake", "version": "1"}},
+                });
+                return Ok(CallToolResponse::InputRequired(
+                    serde_json::from_value(asked).unwrap(),
+                ));
+            }
+            return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::text("cannot ask"),
+            ])));
+        }
         if req.name == "fail" {
             return Err(ErrorData::invalid_params("upstream says no", None));
         }
@@ -817,12 +899,25 @@ async fn serve_fake(
     CancellationToken,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
+    serve_fake_with(fake, json!({}), timings, store).await
+}
+
+/// [`serve_fake`], with more settings for the server.
+async fn serve_fake_with(
+    fake: Fake,
+    settings: serde_json::Value,
+    timings: Timings,
+    store: &SecretStore,
+) -> (
+    u16,
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let fake_port = start_fake(fake).await;
-    let config = parse_config(
-        &json!({"servers": {"fake": {"url": format!("http://127.0.0.1:{fake_port}/mcp")}}})
-            .to_string(),
-    )
-    .unwrap();
+    let mut server = json!({"url": format!("http://127.0.0.1:{fake_port}/mcp")});
+    let settings = settings.as_object().unwrap().clone();
+    server.as_object_mut().unwrap().extend(settings);
+    let config = parse_config(&json!({"servers": {"fake": server}}).to_string()).unwrap();
     let upstream = Upstream::with_timings(config.servers[0].clone(), store.clone(), timings);
     let hub = Hub::new(vec![upstream]);
     let listener = http::bind(0).await.unwrap();
@@ -1181,4 +1276,215 @@ async fn gives_each_connected_agent_its_own_copy() {
     upstream.close().await;
     assert!(!running(&pids()[2]));
     let _ = std::fs::remove_file(&log);
+}
+
+/// An agent of MCP 2026-07-28 behind `mcp-hub connect`, which can show forms.
+async fn modern_agent(
+    port: u16,
+    store: SecretStore,
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let capabilities = serde_json::from_value(json!({"elicitation": {"form": {}}})).unwrap();
+    let info = rmcp::model::ClientConfig::new(
+        capabilities,
+        rmcp::model::Implementation::new("modern", "1"),
+    );
+    let lifecycle = rmcp::ClientLifecycleMode::Discover {
+        preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+    };
+    rmcp::ClientServiceExt::serve_with_lifecycle(info, agent, lifecycle)
+        .await
+        .unwrap()
+}
+
+/// Servers and agents of MCP 2026-07-28 through `mcp-hub connect`: the hub speaks it to
+/// both, passes on a server's request for input, and tells how long its list holds.
+#[tokio::test]
+async fn speaks_mcp_2026_to_agents_and_servers() {
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let (port, _shutdown, _serving) = serve_fake(Fake::default(), Timings::default(), &store).await;
+    let client = modern_agent(port, store.clone()).await;
+    let info = client.peer_info().unwrap();
+    assert_eq!(
+        info.protocol_version,
+        rmcp::model::ProtocolVersion::V_2026_07_28
+    );
+    // `connect` tells it when the tools change, on a subscription.
+    assert_eq!(
+        info.capabilities.tools.as_ref().unwrap().list_changed,
+        Some(true)
+    );
+
+    let listed = client.peer().list_tools(None).await.unwrap();
+    assert_eq!(listed.tools.len(), 1);
+    assert_eq!(listed.ttl_ms, Some(300_000));
+    assert_eq!(listed.cache_scope, Some(rmcp::model::CacheScope::Private));
+
+    // The server asks the user something: the agent gets that as it came, without the
+    // server's name, and calls again with the answer.
+    let mut params = CallToolRequestParams::new("fake__ask");
+    let CallToolResponse::InputRequired(asked) =
+        client.call_tool_once(params.clone()).await.unwrap()
+    else {
+        panic!("expected a request for input");
+    };
+    assert_eq!(asked.request_state.as_deref(), Some("asked-once"));
+    assert!(asked.meta.is_none(), "{:?}", asked.meta);
+    let asked = serde_json::to_value(&asked.input_requests).unwrap();
+    assert_eq!(asked["pick"]["params"]["message"], "Which one?");
+    params.input_responses =
+        serde_json::from_value(json!({"pick": {"action": "accept", "content": {"one": "this"}}}))
+            .unwrap();
+    params.request_state = Some("asked-once".into());
+    let CallToolResponse::Complete(answered) = client.call_tool_once(params).await.unwrap() else {
+        panic!("expected a result");
+    };
+    let text = &answered.content[0].as_text().unwrap().text;
+    assert!(
+        text.contains(r#""one":"this""#) && text.contains("asked-once"),
+        "{text}"
+    );
+    client.cancel().await.unwrap();
+
+    // An agent of an older version cannot be asked: the server is not told it could.
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let capabilities = serde_json::from_value(json!({"elicitation": {"form": {}}})).unwrap();
+    let old =
+        rmcp::model::ClientConfig::new(capabilities, rmcp::model::Implementation::new("old", "1"))
+            .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25);
+    let old = old.serve(agent).await.unwrap();
+    let result = old
+        .call_tool(CallToolRequestParams::new("fake__ask"))
+        .await
+        .unwrap();
+    assert_eq!(result.content[0].as_text().unwrap().text, "cannot ask");
+    old.cancel().await.unwrap();
+}
+
+/// `connect` answers an agent's subscription to tool changes itself.
+#[tokio::test]
+async fn takes_subscriptions_to_tool_changes() {
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let (port, _shutdown, _serving) = serve_fake(Fake::default(), Timings::default(), &store).await;
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let (reading, mut writing) = tokio::io::split(agent);
+    let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reading));
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "raw", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {}});
+    let listen = json!({"jsonrpc": "2.0", "id": "s1", "method": "subscriptions/listen",
+        "params": {"_meta": meta, "notifications": {"toolsListChanged": true, "promptsListChanged": true}}});
+    tokio::io::AsyncWriteExt::write_all(&mut writing, format!("{listen}\n").as_bytes())
+        .await
+        .unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+    assert_eq!(
+        ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        "s1"
+    );
+    // Only what the hub can tell.
+    assert_eq!(
+        ack["params"]["notifications"],
+        json!({"toolsListChanged": true})
+    );
+}
+
+/// The skills of the servers that serve some, if the config asks for them, are the hub's,
+/// their files read from those servers.
+#[tokio::test]
+async fn serves_the_skills_of_its_servers() {
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let fake = || Fake {
+        skills: true,
+        ..Fake::default()
+    };
+    // Not asked for: agents do not even hear of them.
+    let (port, _shutdown, _serving) = serve_fake(fake(), Timings::default(), &store).await;
+    let client = modern_agent(port, store.clone()).await;
+    client.list_all_tools().await.unwrap();
+    client.cancel().await.unwrap();
+    let client = modern_agent(port, store.clone()).await;
+    assert!(
+        client
+            .peer_info()
+            .unwrap()
+            .capabilities
+            .extensions
+            .is_none()
+    );
+    client.cancel().await.unwrap();
+
+    let skills = json!({"skills": true});
+    let (port, _shutdown, _serving) =
+        serve_fake_with(fake(), skills, Timings::default(), &store).await;
+    // Once its server was reached: until then the hub does not know it has skills.
+    let first = modern_agent(port, store.clone()).await;
+    first.list_all_tools().await.unwrap();
+    first.cancel().await.unwrap();
+
+    let client = modern_agent(port, store).await;
+    let capabilities = &client.peer_info().unwrap().capabilities;
+    assert!(
+        capabilities
+            .extensions
+            .as_ref()
+            .unwrap()
+            .contains_key(SKILLS_EXTENSION_ID)
+    );
+    let skills = client.peer().list_skills(None).await.unwrap().skills;
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].uri, DEMO_SKILL);
+    let read = client
+        .peer()
+        .read_resource_once(ReadResourceRequestParams::new(DEMO_SKILL))
+        .await
+        .unwrap();
+    let ReadResourceResponse::Complete(read) = read else {
+        panic!("expected the file")
+    };
+    let text = serde_json::to_value(&read.contents[0]).unwrap();
+    assert_eq!(text["text"], DEMO_SKILL_TEXT);
+    // Only skills' files: the hub has no other resources of its servers to give.
+    let other = client
+        .peer()
+        .read_resource_once(ReadResourceRequestParams::new("file:///etc/passwd"))
+        .await;
+    assert!(
+        matches!(other, Err(rmcp::ServiceError::McpError(ref e)) if e.code.0 == -32602),
+        "{other:?}"
+    );
+    client.cancel().await.unwrap();
 }

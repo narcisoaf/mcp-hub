@@ -11,12 +11,14 @@ use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use rmcp::{
-    ClientHandler, Peer, RoleClient, ServiceError, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, Peer, RoleClient, ServiceError,
     model::{
-        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig, ClientRequest,
-        Implementation, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        CancelledNotificationParam, ClientCapabilities, ClientConfig, ClientRequest,
+        Implementation, ProtocolVersion, RequestId, RequestMetaObject, SKILLS_EXTENSION_ID,
+        ServerResult, Tool,
     },
-    service::{ClientInitializeError, NotificationContext, RunningService},
+    service::{ClientInitializeError, NotificationContext, PeerRequestOptions, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         auth::{AuthClient, AuthorizationManager},
@@ -230,6 +232,21 @@ fn http_client(url: &str) -> reqwest::Client {
     }
 }
 
+/// How to open a connection: the old way only, or MCP 2026-07-28 if the server speaks it.
+fn lifecycle(legacy: bool) -> ClientLifecycleMode {
+    if legacy {
+        ClientLifecycleMode::Initialize
+    } else {
+        ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: None,
+        }
+    }
+}
+
+/// What the hub says of itself to a server. Connecting the old way, it offers 2026-07-28 all
+/// the same, as rmcp does: a server that takes it, as Ultrapaint's relay does, then speaks it
+/// in every request, and one that does not answers with a version of its own.
 pub fn client_info() -> ClientConfig {
     ClientConfig::new(
         ClientCapabilities::default(),
@@ -291,6 +308,12 @@ struct SavedTools {
     fingerprint: String,
     tools: Vec<Tool>,
     full: HashMap<String, Vec<(String, String)>>,
+    /// See [`Upstream::serves_skills`].
+    #[serde(default)]
+    skills: bool,
+    /// The server speaks only MCP from before 2026-07-28: see [`Upstream::connect`].
+    #[serde(default)]
+    legacy: bool,
 }
 
 /// An upstream that failed, and until when it is not tried again.
@@ -336,6 +359,14 @@ pub struct Upstream {
     session: Option<String>,
     /// For a copy: calls that hold it, so that it is not ended between being found and used.
     holders: AtomicUsize,
+    /// The server only speaks MCP from before 2026-07-28: connect to it the old way at once,
+    /// without asking first whether it speaks the new. For a copy, its server's says.
+    legacy: AtomicBool,
+    /// The MCP version the current or last connection speaks.
+    protocol: std::sync::Mutex<Option<String>>,
+    /// The server serves skills (the MCP Skills extension), as last connected to, or as an
+    /// earlier run saved.
+    skills: AtomicBool,
 }
 
 /// A copy of a `perAgent` server lent to one call.
@@ -434,6 +465,9 @@ impl Upstream {
             parent: parent.unwrap_or_default(),
             session,
             holders: AtomicUsize::new(0),
+            legacy: AtomicBool::new(false),
+            protocol: std::sync::Mutex::new(None),
+            skills: AtomicBool::new(false),
         })
     }
 
@@ -446,6 +480,8 @@ impl Upstream {
         let saved = std::fs::read_to_string(&path).ok();
         let saved = saved.and_then(|text| serde_json::from_str::<SavedTools>(&text).ok());
         if let Some(saved) = saved.filter(|saved| saved.fingerprint == self.fingerprint()) {
+            self.skills.store(saved.skills, Ordering::Release);
+            self.legacy.store(saved.legacy, Ordering::Release);
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             *self.cache.lock().unwrap() = Some(CachedTools {
                 tools: Arc::new(saved.tools),
@@ -480,6 +516,8 @@ impl Upstream {
             fingerprint: self.fingerprint(),
             tools: cached.tools.to_vec(),
             full: (*cached.full).clone(),
+            skills: self.skills.load(Ordering::Acquire),
+            legacy: self.legacy.load(Ordering::Acquire),
         };
         let write = || -> std::io::Result<()> {
             crate::stats::private_dir(path.parent().unwrap_or(Path::new(".")))?;
@@ -490,6 +528,50 @@ impl Upstream {
         if let Err(e) = write() {
             tracing::debug!("[{}] cannot save the tool list: {e}", self.name());
         }
+    }
+
+    /// Save the tool list as it is, if it is saved at all.
+    fn save_current(&self) {
+        let cache = self.cache.lock().unwrap();
+        if let Some(cached) = cache.as_ref() {
+            self.save_tools(cached);
+        }
+    }
+
+    /// Whether the hub passes on skills of this server (the MCP Skills extension): files of
+    /// instructions an agent loads when a task calls for them. Only if the config asks for
+    /// them, and not a `perAgent` server's: its copies are for tool calls.
+    pub fn serves_skills(&self) -> bool {
+        self.server.skills && self.copies.is_none() && self.skills.load(Ordering::Acquire)
+    }
+
+    /// Send the server one request other than a tool call (one for its skills, say), which may
+    /// be sent again on a new connection if the old one has gone stale.
+    pub async fn ask<T, F, Fut>(&self, what: &str, send: F) -> Result<T, UpstreamError>
+    where
+        F: Fn(Peer<RoleClient>) -> Fut,
+        Fut: Future<Output = Result<T, ServiceError>>,
+    {
+        for attempt in 0..2 {
+            let lease = self.lease(false).await?;
+            let answer = tokio::time::timeout(LIST_TIMEOUT, send(lease.peer.clone())).await;
+            return match answer {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(ServiceError::McpError(e))) => Err(UpstreamError::Mcp(e)),
+                Ok(Err(e)) => {
+                    self.reset(lease.id, "error").await;
+                    if !lease.fresh && attempt == 0 {
+                        continue;
+                    }
+                    Err(self.convert(e))
+                }
+                Err(_) => {
+                    self.reset(lease.id, "error").await;
+                    Err(UpstreamError::Other(format!("{what} timed out")))
+                }
+            };
+        }
+        unreachable!()
     }
 
     /// Goes up every time the tools this server has change, also when they first arrive.
@@ -513,11 +595,61 @@ impl Upstream {
     }
 
     /// Connect; for a command server, start it and say which process it is.
+    ///
+    /// MCP 2026-07-28 first: the server is asked which versions it speaks (`server/discover`),
+    /// and one that answers with an error, or not within 10 seconds, is connected to the old
+    /// way (`initialize`). A server found to speak only the old is connected to the old way
+    /// from then on, also after a restart, until that fails. A server may still take 2026-07-28
+    /// in `initialize`: see [`client_info`].
     async fn connect(&self) -> Result<(Client, Option<u32>), UpstreamError> {
-        match &self.server.endpoint {
-            Endpoint::Http(url) => Ok((self.connect_http(url.as_str()).await?, None)),
-            Endpoint::Stdio(stdio) => self.connect_stdio(stdio).await,
+        let owner = self.parent.upgrade();
+        let owner = owner.as_deref().unwrap_or(self);
+        let legacy = owner.legacy.load(Ordering::Acquire);
+        let connected = self.connect_as(lifecycle(legacy)).await;
+        if legacy && matches!(connected, Err(UpstreamError::Other(_))) {
+            // Maybe it speaks the new by now: it is asked again next time.
+            owner.legacy.store(false, Ordering::Release);
         }
+        if let Ok((client, _)) = &connected {
+            let version = client
+                .peer()
+                .peer_info()
+                .map(|i| i.protocol_version.clone());
+            let old = version.as_ref().is_none_or(ProtocolVersion::has_initialize);
+            if old && !legacy {
+                tracing::debug!("[{}] speaks MCP from before 2026-07-28", self.name());
+            }
+            if let Some(info) = client.peer().peer_info() {
+                let capabilities = serde_json::to_string(&info.capabilities).unwrap_or_default();
+                tracing::debug!("[{}] capabilities: {capabilities}", self.name());
+                let extensions = info.capabilities.extensions.as_ref();
+                let skills = extensions.is_some_and(|e| e.contains_key(SKILLS_EXTENSION_ID));
+                let changed = owner.skills.swap(skills, Ordering::AcqRel) != skills;
+                // Connected the old way, it stays so, whatever version it then took.
+                let legacy = legacy || old;
+                // For a restarted hub to know at once.
+                if owner.legacy.swap(legacy, Ordering::AcqRel) != legacy || changed {
+                    owner.save_current();
+                }
+            }
+            *self.protocol.lock().unwrap() = version.map(|v| v.to_string());
+        }
+        connected
+    }
+
+    async fn connect_as(
+        &self,
+        lifecycle: ClientLifecycleMode,
+    ) -> Result<(Client, Option<u32>), UpstreamError> {
+        match &self.server.endpoint {
+            Endpoint::Http(url) => Ok((self.connect_http(url.as_str(), lifecycle).await?, None)),
+            Endpoint::Stdio(stdio) => self.connect_stdio(stdio, lifecycle).await,
+        }
+    }
+
+    /// The MCP version the server speaks, as last connected to.
+    pub fn protocol(&self) -> Option<String> {
+        self.protocol.lock().unwrap().clone()
     }
 
     fn connect_timed_out(&self) -> UpstreamError {
@@ -545,6 +677,7 @@ impl Upstream {
     async fn connect_stdio(
         &self,
         stdio: &StdioCommand,
+        lifecycle: ClientLifecycleMode,
     ) -> Result<(Client, Option<u32>), UpstreamError> {
         let name = &self.server.name;
         let mut cmd = tokio::process::Command::new(&stdio.command);
@@ -589,7 +722,11 @@ impl Upstream {
             })?;
         let pid = transport.id();
         let stderr = stderr.map(|s| tokio::spawn(log_stderr(name.clone(), s)));
-        match self.handler().serve(transport).await {
+        match self
+            .handler()
+            .serve_with_lifecycle(transport, lifecycle)
+            .await
+        {
             Ok(client) => Ok((client, pid)),
             Err(e) => {
                 // The failed handshake dropped the transport, which kills the process; what it
@@ -606,7 +743,11 @@ impl Upstream {
         }
     }
 
-    async fn connect_http(&self, url: &str) -> Result<Client, UpstreamError> {
+    async fn connect_http(
+        &self,
+        url: &str,
+        lifecycle: ClientLifecycleMode,
+    ) -> Result<Client, UpstreamError> {
         let name = &self.server.name;
         let other = |e: &dyn std::fmt::Display| UpstreamError::Other(e.to_string());
         let config = StreamableHttpClientTransportConfig::with_uri(url);
@@ -614,7 +755,9 @@ impl Upstream {
             Auth::None => {
                 let transport =
                     StreamableHttpClientTransport::with_client(http_client(url), config);
-                self.handler().serve(transport).await
+                self.handler()
+                    .serve_with_lifecycle(transport, lifecycle)
+                    .await
             }
             Auth::Bearer => {
                 let token = self
@@ -631,7 +774,9 @@ impl Upstream {
                     http_client(url),
                     config.auth_header(token),
                 );
-                self.handler().serve(transport).await
+                self.handler()
+                    .serve_with_lifecycle(transport, lifecycle)
+                    .await
             }
             Auth::OAuth { .. } => {
                 // Read the keyring fresh on every connect: `mcp-hub login` may have run meanwhile.
@@ -649,8 +794,9 @@ impl Upstream {
                     )));
                 }
                 let http = AuthClient::new(http_client(url), manager);
+                let transport = StreamableHttpClientTransport::with_client(http, config);
                 self.handler()
-                    .serve(StreamableHttpClientTransport::with_client(http, config))
+                    .serve_with_lifecycle(transport, lifecycle)
                     .await
             }
         };
@@ -711,6 +857,7 @@ impl Upstream {
                         "pid": pid,
                         "ms": ms,
                         "agent": self.session,
+                        "protocol": self.protocol(),
                     }),
                 );
                 let id = self.connections.fetch_add(1, Ordering::Relaxed);
@@ -1001,20 +1148,21 @@ impl Upstream {
         params: CallToolRequestParams,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
-        self.call_tool_for(params, None, cancel).await
+        self.call_tool_for(params, Caller::default(), cancel).await
     }
 
-    /// [`Upstream::call_tool`] for the agent in `session`: a `perAgent` server passes it to
-    /// that session's copy, started now if it has none.
+    /// [`Upstream::call_tool`] for the agent `caller`: a `perAgent` server passes it to that
+    /// agent session's copy, started now if it has none.
     pub async fn call_tool_for(
         &self,
         params: CallToolRequestParams,
-        session: Option<&str>,
+        caller: Caller<'_>,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
         if self.copies.is_none() {
-            return self.call_own(params, cancel).await;
+            return self.call_own(params, caller.asks, cancel).await;
         }
+        let session = caller.session;
         let Some(session) = session else {
             return Err(UpstreamError::Other(format!(
                 "{} gives every agent session a copy of its own, and this agent did not say \
@@ -1023,7 +1171,7 @@ impl Upstream {
             )));
         };
         let copy = self.copy_for(session)?;
-        copy.0.call_own(params, cancel).await
+        copy.0.call_own(params, caller.asks, cancel).await
     }
 
     /// The copy of this `perAgent` server for `session`, made now if there is none.
@@ -1152,6 +1300,7 @@ impl Upstream {
     async fn call_own(
         &self,
         params: CallToolRequestParams,
+        asks: Option<&ClientCapabilities>,
         cancel: CancellationToken,
     ) -> Result<CallToolResponse, UpstreamError> {
         let lease = self.lease(true).await?;
@@ -1160,7 +1309,7 @@ impl Upstream {
             self.refresh();
         }
         let limit = self.timings.call_timeout;
-        let call = tokio::time::timeout(limit, lease.peer.call_tool_once(params));
+        let call = tokio::time::timeout(limit, send_call(&lease.peer, params, asks));
         tokio::select! {
             result = call => match result {
                 Ok(Ok(response)) => {
@@ -1236,6 +1385,71 @@ impl Drop for Upstream {
             // SAFETY: as in `Conn::close_within`: the group is the server's own.
             unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
         }
+    }
+}
+
+/// Who a tool call is for.
+#[derive(Default, Clone, Copy)]
+pub struct Caller<'a> {
+    /// The agent session, for a `perAgent` server: see [`crate::hub::SESSION_HEADER`].
+    pub session: Option<&'a str>,
+    /// What the agent can ask its user, if it speaks MCP 2026-07-28: see [`send_call`].
+    pub asks: Option<&'a ClientCapabilities>,
+}
+
+/// Send a tools/call. For an agent that speaks MCP 2026-07-28 and can do what `asks` says
+/// (show the user a form, have its model answer, say its folders), and a server that speaks
+/// that version too, the server is told so. It may then answer that it needs such input
+/// first: the agent gets that answer as it is, and calls again with the input.
+async fn send_call(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    asks: Option<&ClientCapabilities>,
+) -> Result<CallToolResponse, ServiceError> {
+    let modern = (peer.peer_info()).is_some_and(|info| !info.protocol_version.has_initialize());
+    let Some(asks) = asks.filter(|_| modern) else {
+        return peer.call_tool_once(params).await;
+    };
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.elicitation = asks.elicitation.clone();
+    capabilities.sampling = asks.sampling.clone();
+    capabilities.roots = asks.roots.clone();
+    let mut meta = RequestMetaObject::new();
+    meta.set_client_capabilities(capabilities);
+    let mut options = PeerRequestOptions::no_options();
+    options.meta = Some(meta);
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let handle = peer.send_request_with_option(request, options).await?;
+    let mut abandoned = Abandoned(Some((peer.clone(), handle.id.clone())));
+    let result = handle.await_response().await;
+    abandoned.0 = None;
+    match result? {
+        ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+        ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
+        ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+        // A result with nothing in it, which rmcp may have taken for another kind.
+        other => serde_json::to_value(other)
+            .ok()
+            .and_then(|value| serde_json::from_value::<CallToolResult>(value).ok())
+            .map(CallToolResponse::Complete)
+            .ok_or(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// Tells the server that a request was given up, when the call waiting for it is dropped.
+struct Abandoned(Option<(Peer<RoleClient>, RequestId)>);
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        let Some((peer, id)) = self.0.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let reason = Some("cancelled by the client".to_owned());
+            let _ = peer
+                .notify_cancelled(CancelledNotificationParam::new(Some(id), reason))
+                .await;
+        });
     }
 }
 

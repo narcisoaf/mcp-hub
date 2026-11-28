@@ -152,7 +152,9 @@ impl Calls {
     fn add(&mut self, event: &Value) {
         self.ms.push(event["ms"].as_u64().unwrap_or(0));
         self.chars.push(event["text"].as_u64().unwrap_or(0));
-        self.failed += u64::from(event["outcome"] != "ok");
+        // A tool asking for the user's input first did what it should.
+        let done = matches!(event["outcome"].as_str(), Some("ok" | "input_required"));
+        self.failed += u64::from(!done);
         self.cut += u64::from(event["cut"].as_u64().is_some());
         self.compacted += event["compacted"].as_u64().unwrap_or(0);
     }

@@ -8,16 +8,18 @@ use std::time::Instant;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
-        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        DiscoverResult, GetSkillRequestParams, GetSkillResult, Implementation,
+        InitializeRequestParams, InitializeResult, JsonObject, ListSkillsResult, ListToolsResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ResourcesCapability, SKILLS_EXTENSION_ID, ServerCapabilities, ServerConfig, Skill, Tool,
     },
     service::RequestContext,
 };
 use serde_json::{Value, json};
 
 use crate::stats::Stats;
-use crate::upstream::{Upstream, UpstreamError};
+use crate::upstream::{Caller, Upstream, UpstreamError};
 
 pub const SEP: &str = "__";
 
@@ -92,6 +94,9 @@ struct Client {
     session: Option<String>,
     /// The folder it works in, for the servers with a `folderArgument`.
     folder: Option<String>,
+    /// What it can ask its user, if it speaks MCP 2026-07-28: the servers that speak it too
+    /// may then ask it for input. See [`crate::upstream::Caller::asks`].
+    asks: Option<rmcp::model::ClientCapabilities>,
 }
 
 impl Client {
@@ -102,11 +107,16 @@ impl Client {
         };
         let header = |name| http.headers.get(name).and_then(|value| value.to_str().ok());
         let name = header(CLIENT_HEADER).or_else(|| header("user-agent"));
+        // Only an agent of 2026-07-28 can be asked through the hub. An older one would be
+        // asked with a request of the server's own, which takes a session the hub does not keep.
+        let modern = context.meta.protocol_version();
+        let modern = modern.is_some_and(|version| !version.has_initialize());
         Self {
             skip: skipped(&http.headers),
             name: name.map(|name| name.chars().take(80).collect()),
             session: session(&http.headers),
             folder: folder(&http.headers),
+            asks: modern.then(|| context.meta.client_capabilities()).flatten(),
         }
     }
 
@@ -148,6 +158,12 @@ pub const DESCRIBE: &str = "hub__describe";
 
 /// In a tools/list result's `_meta`: the version of the list (see [`Hub::tools_version`]).
 pub const TOOLS_META: &str = "dev.mcp-hub/tools";
+
+/// How long an agent of MCP 2026-07-28 may keep the hub's tool list and instructions without
+/// asking again (`ttlMs`): as long as the hub keeps each server's list. Not while servers are
+/// still starting, whose tools are yet to come. `mcp-hub connect` tells agents of changes
+/// sooner. Older agents get no such hint.
+const LIST_TTL_MS: u64 = 300_000;
 
 /// `text` cut to about `max` characters, where a paragraph or a line ends if one does
 /// nearby, with a note saying where the rest is. `None` if it is short enough as it is.
@@ -317,6 +333,28 @@ pub struct Hub {
     results: Arc<PathBuf>,
     /// Tells this hub from one that ran before it, in [`Hub::tools_version`].
     started: u128,
+    /// Which server each skill listed is from, by the URI its files start with.
+    skills: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+/// The URIs of skills' files start with this.
+const SKILL_SCHEME: &str = "skill://";
+
+/// Most pages of skills asked of one server.
+const MAX_SKILL_PAGES: usize = 20;
+
+/// Where a skill's files are: the URI of its `SKILL.md` without that name.
+fn skill_root(uri: &str) -> &str {
+    uri.rfind('/').map_or(uri, |at| &uri[..=at])
+}
+
+/// An error of a server, for the agent: a JSON-RPC error as the server gave it, anything else
+/// in the hub's words.
+fn rpc_error(server: &str, error: UpstreamError) -> ErrorData {
+    match error {
+        UpstreamError::Mcp(e) => e,
+        e => ErrorData::internal_error(format!("mcp-hub: {server}: {e}"), None),
+    }
 }
 
 /// How much a tool call returned, for the record: characters of text, and bytes of
@@ -331,6 +369,20 @@ fn sizes(response: &CallToolResponse) -> (usize, usize) {
         texts.map(|text| text.text.chars().count()).sum(),
         structured.map_or(0, |value| value.to_string().len()),
     )
+}
+
+/// In a result's `_meta` from MCP 2026-07-28 on: which server answered.
+const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
+
+/// A result's `_meta` without the server's name and version, which every result of a server
+/// of MCP 2026-07-28 carries: the agent knows which server it called, and has no use for them.
+fn without_server_info(meta: &mut Option<rmcp::model::MetaObject>) {
+    if let Some(object) = meta {
+        object.0.remove(SERVER_INFO_META);
+        if object.0.is_empty() {
+            *meta = None;
+        }
+    }
 }
 
 /// Something the hub itself has to tell the agent about a call: a tool error, which the
@@ -353,7 +405,92 @@ impl Hub {
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos()),
+            skills: Arc::default(),
         }
+    }
+
+    /// The servers whose skills `client` gets.
+    fn skill_servers<'a>(&'a self, client: &'a Client) -> impl Iterator<Item = &'a Arc<Upstream>> {
+        let upstreams = self.upstreams.iter();
+        upstreams.filter(|u| u.serves_skills() && !client.skips(u))
+    }
+
+    /// Every skill of every server that serves some, for `client`, in config order.
+    async fn list_skills_for(&self, client: &Client) -> Vec<Skill> {
+        let asking = self.skill_servers(client).map(|u| async move {
+            let listed = u
+                .ask("skills/list", |peer| async move {
+                    let (mut skills, mut cursor) = (Vec::new(), None);
+                    for _ in 0..MAX_SKILL_PAGES {
+                        let params =
+                            cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
+                        let page = peer.list_skills(params).await?;
+                        skills.extend(page.skills);
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Ok(skills)
+                })
+                .await;
+            (u, listed)
+        });
+        let mut skills = Vec::new();
+        for (upstream, listed) in futures::future::join_all(asking).await {
+            match listed {
+                Ok(listed) => {
+                    let mut owners = self.skills.lock().unwrap();
+                    for skill in &listed {
+                        let root = skill_root(&skill.uri).to_owned();
+                        owners.insert(root, upstream.name().to_owned());
+                    }
+                    skills.extend(listed);
+                }
+                Err(e) => tracing::warn!("[{}] skills/list failed: {e}", upstream.name()),
+            }
+        }
+        skills
+    }
+
+    /// The server a skill's file at `uri` is from: the one that listed it, or, if `client`
+    /// gets the skills of only one server, that one.
+    fn skill_owner<'a>(&'a self, client: &'a Client, uri: &str) -> Option<&'a Arc<Upstream>> {
+        let listed = {
+            let owners = self.skills.lock().unwrap();
+            let found = owners
+                .iter()
+                .filter(|(root, _)| uri.starts_with(root.as_str()));
+            found
+                .max_by_key(|(root, _)| root.len())
+                .map(|(_, server)| server.clone())
+        };
+        let mut servers = self.skill_servers(client);
+        match listed {
+            Some(server) => servers.find(|u| u.name() == server),
+            None => servers.next().filter(|_| servers.next().is_none()),
+        }
+    }
+
+    /// Record a request for a skill or its files.
+    fn record_skill(
+        &self,
+        client: &Client,
+        server: &str,
+        method: &str,
+        started: Instant,
+        ok: bool,
+    ) {
+        self.stats.record(
+            "skill",
+            json!({
+                "server": server,
+                "method": method,
+                "client": client.name,
+                "ms": started.elapsed().as_millis() as u64,
+                "outcome": if ok { "ok" } else { "failed" },
+            }),
+        );
     }
 
     /// For an agent that leaves out the servers in `skip`: something that changes whenever
@@ -371,14 +508,15 @@ impl Hub {
         (self.version(changes), pending)
     }
 
-    /// Ask every server for its tools now, all at once: how many it has, or why it failed.
-    /// In config order.
-    pub async fn status(&self) -> Vec<(String, Result<usize, String>)> {
+    /// Ask every server for its tools now, all at once: how many it has, or why it failed,
+    /// and the MCP version it speaks. In config order.
+    pub async fn status(&self) -> Vec<(String, Result<usize, String>, Option<String>)> {
         let asking = self.upstreams.iter().map(|u| async move {
             let listed = u.list_tools().await;
             (
                 u.name().to_owned(),
                 listed.map(|t| t.len()).map_err(|e| e.to_string()),
+                u.protocol(),
             )
         });
         futures::future::join_all(asking).await
@@ -523,7 +661,14 @@ impl Hub {
 
 impl ServerHandler for Hub {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        // A skill's files are resources: the hub serves those of its servers' skills.
+        if self.upstreams.iter().any(|u| u.serves_skills()) {
+            capabilities.resources = Some(ResourcesCapability::default());
+            let skills = (SKILLS_EXTENSION_ID.to_owned(), JsonObject::new());
+            capabilities.extensions = Some([skills].into_iter().collect());
+        }
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("mcp-hub", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions())
     }
@@ -547,7 +692,10 @@ impl ServerHandler for Hub {
         let mut info = self.get_info();
         info.instructions = Some(self.instructions_for(&Client::of(&context)));
         let versions = self.supported_protocol_versions().into_owned();
-        Ok(DiscoverResult::from_server_info(versions, info))
+        // Private: what an agent gets depends on the servers it leaves out.
+        Ok(DiscoverResult::from_server_info(versions, info)
+            .with_ttl_ms(LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn list_tools(
@@ -567,10 +715,81 @@ impl ServerHandler for Hub {
             }),
         );
         let mut result = ListToolsResult::with_all_items(tools);
+        let (_, pending) = self.tools_version(&client.skip);
+        result.ttl_ms = Some(if pending > 0 { 0 } else { LIST_TTL_MS });
+        // Private: what an agent gets depends on its headers.
+        result.cache_scope = Some(CacheScope::Private);
         // Exactly the version of this list, for `mcp-hub connect`; the header may be older.
         let meta = serde_json::Map::from_iter([(TOOLS_META.to_owned(), version.into())]);
         result.meta = Some(rmcp::model::MetaObject(meta));
         Ok(result)
+    }
+
+    async fn list_skills(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        let (client, started) = (Client::of(&context), Instant::now());
+        let skills = self.list_skills_for(&client).await;
+        self.record_skill(&client, "hub", "skills/list", started, true);
+        let mut result = ListSkillsResult::with_all_items(skills);
+        result.ttl_ms = Some(LIST_TTL_MS);
+        result.cache_scope = Some(CacheScope::Private);
+        Ok(result)
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, ErrorData> {
+        let (client, started) = (Client::of(&context), Instant::now());
+        let Some(upstream) = self.skill_owner(&client, &request.uri) else {
+            let message = format!("No skill at {}", request.uri);
+            return Err(ErrorData::invalid_params(message, None));
+        };
+        let got = upstream
+            .ask("skills/get", |peer| {
+                let request = request.clone();
+                async move { peer.get_skill(request).await }
+            })
+            .await;
+        self.record_skill(&client, upstream.name(), "skills/get", started, got.is_ok());
+        got.map_err(|e| rpc_error(upstream.name(), e))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let (client, started) = (Client::of(&context), Instant::now());
+        let owner = request.uri.starts_with(SKILL_SCHEME);
+        let Some(upstream) = owner
+            .then(|| self.skill_owner(&client, &request.uri))
+            .flatten()
+        else {
+            let message = format!(
+                "No resource at {}: mcp-hub serves only the files of its servers' skills",
+                request.uri
+            );
+            return Err(ErrorData::invalid_params(message, None));
+        };
+        let read = upstream
+            .ask("resources/read", |peer| {
+                let request = request.clone();
+                async move { peer.read_resource_once(request).await }
+            })
+            .await;
+        self.record_skill(
+            &client,
+            upstream.name(),
+            "resources/read",
+            started,
+            read.is_ok(),
+        );
+        read.map_err(|e| rpc_error(upstream.name(), e))
     }
 
     async fn call_tool(
@@ -605,6 +824,7 @@ impl ServerHandler for Hub {
         };
         let (client, started) = (Client::of(&context), Instant::now());
         let (mut cut, mut compacted, mut folded) = (None, 0, false);
+        let answering = request.input_responses.is_some() || request.request_state.is_some();
         let (outcome, error, response) = if client.skips(upstream) {
             let var = upstream.server.skip_when_env.as_deref();
             let why = var
@@ -627,15 +847,35 @@ impl ServerHandler for Hub {
                     folded = true;
                 }
             }
-            let session = client.session.as_deref();
-            match upstream.call_tool_for(request, session, context.ct).await {
+            let caller = Caller {
+                session: client.session.as_deref(),
+                asks: client.asks.as_ref(),
+            };
+            match upstream.call_tool_for(request, caller, context.ct).await {
                 Ok(CallToolResponse::Complete(mut result)) => {
+                    without_server_info(&mut result.meta);
                     (cut, compacted) = self.shrink(upstream, &tool, &mut result);
                     let outcome = match result.is_error {
                         Some(true) => "tool_error",
                         _ => "ok",
                     };
                     (outcome, None, Ok(CallToolResponse::Complete(result)))
+                }
+                Ok(CallToolResponse::InputRequired(_)) if client.asks.is_none() => {
+                    let text = format!(
+                        "mcp-hub: {} needs input from the user for this, and this agent \
+                         cannot be asked through mcp-hub: that takes MCP 2026-07-28.",
+                        upstream.name()
+                    );
+                    ("cannot_ask", None, Ok(note(text)))
+                }
+                Ok(CallToolResponse::InputRequired(mut asked)) => {
+                    without_server_info(&mut asked.meta);
+                    (
+                        "input_required",
+                        None,
+                        Ok(CallToolResponse::InputRequired(asked)),
+                    )
                 }
                 Ok(response) => ("ok", None, Ok(response)),
                 // Its message may repeat what was asked: only the code is recorded.
@@ -665,6 +905,7 @@ impl ServerHandler for Hub {
                 "cut": cut,
                 "compacted": (compacted > 0).then_some(compacted),
                 "folder": folded.then_some(true),
+                "answering": answering.then_some(true),
             }),
         );
         response

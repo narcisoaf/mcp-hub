@@ -1,13 +1,13 @@
 [package]
 name = "mcp-hub"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Personal localhost MCP proxy: one URL, many upstream MCP servers, credentials in the OS keyring"
 publish = false
 
 [dependencies]
-rmcp = { version = "=3.9.0", default-features = false, features = [
+rmcp = { version = "=3.12.0", default-features = false, features = [
     "client",
     "server",
     "auth",

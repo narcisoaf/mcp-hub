@@ -25,8 +25,17 @@ use crate::http::{END_SESSION_PATH, PENDING_HEADER, TOOLS_HEADER};
 use crate::hub::{CLIENT_HEADER, FOLDER_HEADER, SESSION_HEADER, SKIP_HEADER, TOOLS_META};
 use crate::secrets::SecretStore;
 
-/// Sent on requests after `initialize`, as an HTTP client would.
+/// Sent on requests after `initialize`, as an HTTP client would, and on every request of an
+/// agent that speaks MCP 2026-07-28, with its version.
 const PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
+/// From MCP 2026-07-28 on, HTTP requests say their method and what they name in headers too.
+const METHOD_HEADER: &str = "Mcp-Method";
+const NAME_HEADER: &str = "Mcp-Name";
+/// In a request's `_meta` from MCP 2026-07-28 on: the version it speaks, and who sends it.
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
+/// On every message of a `subscriptions/listen` stream: the id of the request that opened it.
+const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 /// How long a request waits for a hub that is not listening, as while it restarts.
 const HUB_DOWN_TRIES: u32 = 6;
 /// How often to ask the hub while some of its servers have yet to list their tools.
@@ -100,6 +109,8 @@ pub async fn headers(store: &SecretStore, skip: &[String]) -> Result<Vec<(&'stat
     Ok(headers)
 }
 
+type Headers = Vec<(&'static str, String)>;
+
 struct Bridge<W> {
     url: String,
     /// See [`session_id`].
@@ -122,6 +133,12 @@ struct Bridge<W> {
     listed: Mutex<Option<String>>,
     /// Whether it is asking the hub again until all servers listed their tools.
     polling: AtomicBool,
+    /// The agent opened the session the old way (`initialize`): it takes a change of tools
+    /// whenever it comes. One that speaks MCP 2026-07-28 is told only on a subscription.
+    initialized: AtomicBool,
+    /// The agent's `subscriptions/listen` requests for tool changes, by id: the bridge
+    /// answers them itself, as the hub keeps no stream open.
+    subscriptions: Mutex<Vec<Value>>,
 }
 
 /// The hub's answer to one message.
@@ -131,6 +148,47 @@ struct Answer {
     tools: Option<String>,
     /// How many servers have yet to list their tools.
     pending: usize,
+}
+
+/// The headers an HTTP client of MCP 2026-07-28 sends with `message`: its version, method and
+/// what it names. None for a message of an older version, which carries no version of its own.
+fn modern_headers(message: &Value) -> Vec<(&'static str, String)> {
+    let Some(version) = message["params"]["_meta"][META_VERSION].as_str() else {
+        return Vec::new();
+    };
+    let Some(method) = message["method"].as_str() else {
+        return Vec::new();
+    };
+    let mut headers = vec![
+        (PROTOCOL_VERSION, version.to_owned()),
+        (METHOD_HEADER, method.to_owned()),
+    ];
+    let named = match method {
+        "tools/call" | "prompts/get" => Some("name"),
+        "resources/read" | "resources/subscribe" | "resources/unsubscribe" => Some("uri"),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => Some("taskId"),
+        _ => None,
+    };
+    if let Some(name) = named.and_then(|key| message["params"][key].as_str()) {
+        headers.push((NAME_HEADER, header_value(name)));
+    }
+    headers
+}
+
+/// `value` as a header value: as it is, or in Base64 between `=?base64?` and `?=` if it has
+/// characters a header cannot carry, or would be taken for that.
+fn header_value(value: &str) -> String {
+    use base64::Engine;
+    let edges = [value.chars().next(), value.chars().last()];
+    let unsafe_edge = edges.iter().any(|c| matches!(c, Some(' ' | '\t')));
+    let unsafe_char = value.chars().any(|c| !(' '..='~').contains(&c));
+    let looks_encoded = value.starts_with("=?base64?") && value.ends_with("?=");
+    if unsafe_edge || unsafe_char || looks_encoded {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        format!("=?base64?{encoded}?=")
+    } else {
+        value.to_owned()
+    }
 }
 
 /// What to tell the agent when its request could not be forwarded.
@@ -155,8 +213,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
         let _ = output.flush().await;
     }
 
-    /// POST one message to the hub. No body when the hub has nothing to answer.
-    async fn post(&self, body: &str) -> Result<Answer, String> {
+    /// POST one message to the hub, with `extra` headers. No body when the hub has nothing
+    /// to answer.
+    async fn post(&self, body: &str, extra: &[(&'static str, String)]) -> Result<Answer, String> {
         let mut reloaded = false;
         let mut tries = 0;
         loop {
@@ -169,8 +228,14 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             for (name, value) in self.headers.lock().unwrap().iter() {
                 request = request.header(*name, value);
             }
-            if let Some(version) = self.protocol.lock().unwrap().as_ref() {
+            let modern = extra.iter().any(|(name, _)| *name == PROTOCOL_VERSION);
+            if let Some(version) = self.protocol.lock().unwrap().as_ref()
+                && !modern
+            {
                 request = request.header(PROTOCOL_VERSION, version);
+            }
+            for (name, value) in extra {
+                request = request.header(*name, value);
             }
             if let Some(agent) = self.agent.lock().unwrap().as_ref() {
                 request = request.header(CLIENT_HEADER, agent);
@@ -232,8 +297,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
         }
     }
 
-    async fn request(self: &Arc<Self>, id: Value, method: &str, body: String) {
-        let (mut answer, tools, pending) = match self.post(&body).await {
+    async fn request(self: &Arc<Self>, id: Value, method: &str, body: String, extra: Headers) {
+        let (mut answer, tools, pending) = match self.post(&body, &extra).await {
             Ok(Answer {
                 body: Some(body),
                 tools,
@@ -242,11 +307,14 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             Ok(_) => return,
             Err(message) => (failure(&id, message), None, 0),
         };
-        if method == "initialize"
-            && let Ok(mut value) = serde_json::from_slice::<Value>(&answer)
-            && let Some(version) = value["result"]["protocolVersion"].as_str()
-        {
-            *self.protocol.lock().unwrap() = Some(version.to_owned());
+        let opening = matches!(method, "initialize" | "server/discover");
+        if opening && let Ok(mut value) = serde_json::from_slice::<Value>(&answer) {
+            if method == "initialize"
+                && let Some(version) = value["result"]["protocolVersion"].as_str()
+            {
+                *self.protocol.lock().unwrap() = Some(version.to_owned());
+                self.initialized.store(true, Ordering::Release);
+            }
             // This bridge, not the hub, tells the agent when the tools change.
             if let Some(capabilities) = value["result"]["capabilities"].as_object_mut() {
                 let tools = capabilities.entry("tools").or_insert_with(|| json!({}));
@@ -275,6 +343,44 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
         }
     }
 
+    /// Answer a `subscriptions/listen` request: the bridge keeps it, and tells the agent on it
+    /// when the tools change. Only that: the hub has nothing else to tell.
+    async fn listen(&self, id: Value, message: &Value) {
+        let wanted = &message["params"]["notifications"];
+        let tools = wanted["toolsListChanged"].as_bool() == Some(true);
+        let notifications = if tools {
+            json!({"toolsListChanged": true})
+        } else {
+            json!({})
+        };
+        let ack = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"_meta": {META_SUBSCRIPTION: id}, "notifications": notifications},
+        });
+        if tools {
+            self.subscriptions.lock().unwrap().push(id);
+        }
+        self.write(ack.to_string().into_bytes()).await;
+    }
+
+    /// Tell the agent that the tools changed: on each of its subscriptions, or, for an agent
+    /// of an older version, as a notification of its own.
+    async fn tools_changed(&self) {
+        let subscriptions = self.subscriptions.lock().unwrap().clone();
+        for id in subscriptions {
+            let message = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {"_meta": {META_SUBSCRIPTION: id}},
+            });
+            self.write(message.to_string().into_bytes()).await;
+        }
+        if self.initialized.load(Ordering::Acquire) {
+            self.write(LIST_CHANGED.to_vec()).await;
+        }
+    }
+
     /// Tell the agent if the hub's tool list is not the one it has.
     async fn compare(&self, tools: Option<String>) {
         let Some(tools) = tools else { return };
@@ -287,7 +393,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             changed
         };
         if changed {
-            self.write(LIST_CHANGED.to_vec()).await;
+            self.tools_changed().await;
         }
     }
 
@@ -302,7 +408,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
             while since.elapsed() < POLL_FOR {
                 tokio::time::sleep(POLL_EVERY).await;
                 let ping = r#"{"jsonrpc":"2.0","id":"mcp-hub-connect","method":"ping"}"#;
-                let Ok(answer) = bridge.post(ping).await else {
+                let Ok(answer) = bridge.post(ping, &[]).await else {
                     continue;
                 };
                 bridge.compare(answer.tools).await;
@@ -394,6 +500,8 @@ where
         running: Mutex::new(HashMap::new()),
         listed: Mutex::new(None),
         polling: AtomicBool::new(false),
+        initialized: AtomicBool::new(false),
+        subscriptions: Mutex::new(Vec::new()),
     });
     let mut lines = BufReader::new(input).lines();
     let stop = stopped();
@@ -417,21 +525,42 @@ where
         if method == "notifications/cancelled" {
             // The hub keeps no session, so it cannot be told. Dropping the request closes
             // its connection, which the hub takes as the cancellation.
-            let key = message["params"]["requestId"].to_string();
+            let cancelled = &message["params"]["requestId"];
+            let key = cancelled.to_string();
             if let Some(task) = bridge.running.lock().unwrap().remove(&key) {
                 task.abort();
             }
+            bridge
+                .subscriptions
+                .lock()
+                .unwrap()
+                .retain(|id| id != cancelled);
+            continue;
+        }
+        if method == "subscriptions/listen"
+            && let Some(id) = id
+        {
+            bridge.listen(id, &message).await;
             continue;
         }
         let method = method.to_owned();
-        if method == "initialize" {
-            let info = &message["params"]["clientInfo"];
+        // The agent names itself when it opens the session, or from MCP 2026-07-28 on, in
+        // every request.
+        let info = match method.as_str() {
+            "initialize" => Some(&message["params"]["clientInfo"]),
+            _ => Some(&message["params"]["_meta"][META_CLIENT]).filter(|info| info.is_object()),
+        };
+        let unnamed = bridge.agent.lock().unwrap().is_none();
+        if let Some(info) = info
+            && (method == "initialize" || unnamed)
+        {
             let name = info["name"].as_str().unwrap_or("unknown");
             let agent = format!("{name}/{}", info["version"].as_str().unwrap_or("?"));
             // Header values are printable ASCII.
             let agent = agent.chars().filter(|c| c.is_ascii_graphic()).take(80);
             *bridge.agent.lock().unwrap() = Some(agent.collect());
         }
+        let extra = modern_headers(&message);
         let key = id.as_ref().map(Value::to_string);
         // Locked across the spawn, so the task cannot finish before it is listed.
         let mut running = bridge.running.lock().unwrap();
@@ -439,8 +568,8 @@ where
             let (bridge, key) = (bridge.clone(), key.clone());
             async move {
                 match id {
-                    Some(id) => bridge.request(id, &method, line).await,
-                    None => drop(bridge.post(&line).await),
+                    Some(id) => bridge.request(id, &method, line, extra).await,
+                    None => drop(bridge.post(&line, &extra).await),
                 }
                 if let Some(key) = key {
                     bridge.running.lock().unwrap().remove(&key);

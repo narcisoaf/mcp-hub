@@ -7,7 +7,7 @@ use std::time::Duration;
 use mcp_hub::{
     config::parse_config,
     secrets::SecretStore,
-    upstream::{Timings, Upstream, UpstreamError},
+    upstream::{Caller, Timings, Upstream, UpstreamError},
 };
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 use serde_json::json;
@@ -121,12 +121,51 @@ async fn runs_a_command_server() {
         fixtures().canonicalize().unwrap().display()
     );
     assert_eq!(call_text(&local, "env").await.unwrap(), expected);
+    // It answered MCP 2026-07-28's first request with an error: an older version, then.
+    assert_eq!(local.protocol().as_deref(), Some("2025-11-25"));
 
     // The process dies mid-call: that call fails, the next one gets a new process.
     assert!(call_text(&local, "crash").await.is_err());
     assert_eq!(call_text(&local, "env").await.unwrap(), expected);
 
     local.close().await;
+}
+
+/// A server that does not answer a request it does not know, as MCP 2026-07-28's first, is
+/// connected to the old way after 10 seconds; after that at once, also by a restarted hub.
+#[tokio::test]
+async fn remembers_a_server_that_speaks_an_older_version() {
+    let log = StartLog::new("older");
+    let saved = std::env::temp_dir().join(format!("mcp-hub-older-lists-{}", std::process::id()));
+    let server = json!({
+        "command": "/bin/sh",
+        "args": [fixtures().join("stdio-server.sh")],
+        "env": {"IGNORE_UNKNOWN": "1", "START_LOG": log.0},
+    });
+    let store = SecretStore::memory();
+    let first = upstream(server.clone(), &store);
+    first.keep_tools_in(&saved);
+    let started = std::time::Instant::now();
+    assert_eq!(first.list_tools().await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_secs(9));
+    assert_eq!(first.protocol().as_deref(), Some("2025-11-25"));
+    // One process: the old way followed on the same connection.
+    assert_eq!(log.starts(), 1);
+    first.close().await;
+
+    let again = std::time::Instant::now();
+    assert!(call_text(&first, "env").await.is_ok());
+    assert!(again.elapsed() < Duration::from_secs(5));
+    first.close().await;
+
+    // A restarted hub, which reads what the first one saved.
+    let restarted = upstream(server, &store);
+    restarted.keep_tools_in(&saved);
+    let again = std::time::Instant::now();
+    assert!(call_text(&restarted, "env").await.is_ok());
+    assert!(again.elapsed() < Duration::from_secs(5));
+    restarted.close().await;
+    let _ = std::fs::remove_dir_all(&saved);
 }
 
 #[tokio::test]
@@ -383,7 +422,10 @@ async fn call_for(upstream: &Upstream, tool: &str, session: &str) -> Result<Stri
     let response = upstream
         .call_tool_for(
             CallToolRequestParams::new(tool.to_owned()),
-            Some(session),
+            Caller {
+                session: Some(session),
+                ..Caller::default()
+            },
             CancellationToken::new(),
         )
         .await?;
