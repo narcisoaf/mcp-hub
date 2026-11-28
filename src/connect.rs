@@ -22,7 +22,7 @@ use tokio::task::AbortHandle;
 use crate::TOKEN_KEY;
 use crate::config::Config;
 use crate::http::{END_SESSION_PATH, PENDING_HEADER, TOOLS_HEADER};
-use crate::hub::{CLIENT_HEADER, SESSION_HEADER, SKIP_HEADER, TOOLS_META};
+use crate::hub::{CLIENT_HEADER, FOLDER_HEADER, SESSION_HEADER, SKIP_HEADER, TOOLS_META};
 use crate::secrets::SecretStore;
 
 /// Sent on requests after `initialize`, as an HTTP client would.
@@ -84,6 +84,13 @@ pub fn session_id() -> String {
     format!("{}.{}.{random}", std::process::id(), pid_namespace())
 }
 
+/// This process's working directory, encoded for [`FOLDER_HEADER`].
+fn working_folder() -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = std::env::current_dir().ok()?;
+    Some(crate::hub::encode_folder(dir.as_os_str().as_bytes()))
+}
+
 /// The HTTP headers an agent has to send to the hub: the token, and the servers to `skip`.
 pub async fn headers(store: &SecretStore, skip: &[String]) -> Result<Vec<(&'static str, String)>> {
     let mut headers = vec![("Authorization", format!("Bearer {}", token(store).await?))];
@@ -97,6 +104,9 @@ struct Bridge<W> {
     url: String,
     /// See [`session_id`].
     session: String,
+    /// The folder the agent works in, encoded for [`FOLDER_HEADER`]: this process's working
+    /// directory, as the agent started it there.
+    folder: Option<String>,
     http: reqwest::Client,
     store: SecretStore,
     skip: Vec<String>,
@@ -166,6 +176,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Bridge<W> {
                 request = request.header(CLIENT_HEADER, agent);
             }
             request = request.header(SESSION_HEADER, &self.session);
+            if let Some(folder) = &self.folder {
+                request = request.header(FOLDER_HEADER, folder);
+            }
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(e) if e.is_connect() && tries < HUB_DOWN_TRIES => {
@@ -365,6 +378,7 @@ where
     let bridge = Arc::new(Bridge {
         url: format!("http://127.0.0.1:{port}/mcp"),
         session: session_id(),
+        folder: working_folder(),
         // No proxy for loopback, whatever the environment says, and no kept connections:
         // a new one costs nothing here, and a kept one can stall on a delayed ACK.
         http: reqwest::Client::builder()

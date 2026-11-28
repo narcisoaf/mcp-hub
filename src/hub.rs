@@ -33,6 +33,44 @@ pub const CLIENT_HEADER: &str = "x-mcp-hub-client";
 /// of the `perAgent` servers. See [`crate::connect::session_id`].
 pub const SESSION_HEADER: &str = "x-mcp-hub-session";
 
+/// Request header with the folder the agent works in, percent-encoded: the working directory
+/// of `mcp-hub connect`, which the agent starts there. The hub gives it to the servers with a
+/// `folderArgument` in their calls, so that agents need not.
+pub const FOLDER_HEADER: &str = "x-mcp-hub-folder";
+
+/// `path` as a header value: every byte but letters, digits and `/-._~` as `%XX`.
+pub fn encode_folder(path: &[u8]) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The folder an agent names in its request's headers: an absolute path, as UTF-8.
+pub fn folder(headers: &hyper::HeaderMap) -> Option<String> {
+    let value = headers.get(FOLDER_HEADER)?.as_bytes();
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut at = 0;
+    while at < value.len() {
+        if value[at] == b'%' {
+            let hex = std::str::from_utf8(value.get(at + 1..at + 3)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            bytes.push(value[at]);
+            at += 1;
+        }
+    }
+    let path = String::from_utf8(bytes).ok()?;
+    let usable = path.starts_with('/') && path.len() <= 4096 && !path.contains('\0');
+    usable.then_some(path)
+}
+
 /// The session an agent names in its request's headers, if it is one `mcp-hub connect` makes.
 pub fn session(headers: &hyper::HeaderMap) -> Option<String> {
     let value = headers.get(SESSION_HEADER)?.to_str().ok()?;
@@ -52,6 +90,8 @@ struct Client {
     name: Option<String>,
     /// Its session, for the servers that give each one a copy of its own.
     session: Option<String>,
+    /// The folder it works in, for the servers with a `folderArgument`.
+    folder: Option<String>,
 }
 
 impl Client {
@@ -66,7 +106,15 @@ impl Client {
             skip: skipped(&http.headers),
             name: name.map(|name| name.chars().take(80).collect()),
             session: session(&http.headers),
+            folder: folder(&http.headers),
         }
+    }
+
+    /// The folder to give `upstream`'s calls, under the argument it takes it in: only for a
+    /// server with a `folderArgument`, and an agent that said where it works.
+    fn folder_for<'a>(&'a self, upstream: &'a Upstream) -> Option<(&'a str, &'a str)> {
+        let argument = upstream.server.folder_argument.as_deref()?;
+        Some((argument, self.folder.as_deref()?))
     }
 
     /// The servers left out, for an event; nothing when there are none.
@@ -207,6 +255,40 @@ pub(crate) fn hub_tools(server: &str, tools: &[Tool], max_description: Option<us
         listed.tools.push(tool);
     }
     listed
+}
+
+/// `tool` without its parameter `argument`, which the hub fills in itself. Also without the
+/// `properties` and `required` that leaves empty, as a server's tool that takes nothing else
+/// was before a relay added the parameter. A tool without it is passed on as it came.
+fn without_argument(tool: &Tool, argument: &str) -> Tool {
+    let schema = &tool.input_schema;
+    let has = |key| {
+        let found = schema.get(key);
+        match found {
+            Some(Value::Object(members)) => members.contains_key(argument),
+            Some(Value::Array(items)) => items.iter().any(|i| i.as_str() == Some(argument)),
+            _ => false,
+        }
+    };
+    if !has("properties") && !has("required") {
+        return tool.clone();
+    }
+    let mut schema = (**schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.remove(argument);
+        if properties.is_empty() {
+            schema.remove("properties");
+        }
+    }
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|name| name.as_str() != Some(argument));
+        if required.is_empty() {
+            schema.remove("required");
+        }
+    }
+    let mut tool = tool.clone();
+    tool.input_schema = Arc::new(schema);
+    tool
 }
 
 /// The definition of [`DESCRIBE`].
@@ -366,14 +448,20 @@ impl Hub {
 
     /// The tools `client` gets, and their version (see [`Hub::tools_version`]).
     async fn tools_for(&self, client: &Client) -> (Vec<Tool>, String) {
-        let upstreams = self.upstreams.iter().filter(|u| !client.skips(u));
-        let lists = futures::future::join_all(upstreams.map(|u| u.tools_as_of())).await;
+        let upstreams: Vec<_> = self.upstreams.iter().filter(|u| !client.skips(u)).collect();
+        let lists = futures::future::join_all(upstreams.iter().map(|u| u.tools_as_of())).await;
         let count = lists.iter().map(|(l, _)| l.as_ref().map_or(0, |l| l.len()));
         let mut tools = Vec::with_capacity(count.sum::<usize>() + 1);
         let mut changes = 0u64;
-        for (list, generation) in lists {
+        for (upstream, (list, generation)) in upstreams.iter().zip(lists) {
             changes = changes.wrapping_add(generation);
-            tools.extend(list.iter().flat_map(|list| list.iter().cloned()));
+            let list = list.iter().flat_map(|list| list.iter());
+            match client.folder_for(upstream) {
+                Some((argument, _)) => {
+                    tools.extend(list.map(|tool| without_argument(tool, argument)));
+                }
+                None => tools.extend(list.cloned()),
+            }
         }
         let mut listing = self.upstreams.iter().filter(|u| !client.skips(u));
         if listing.any(|u| u.cuts_descriptions()) {
@@ -516,7 +604,7 @@ impl ServerHandler for Hub {
             ));
         };
         let (client, started) = (Client::of(&context), Instant::now());
-        let (mut cut, mut compacted) = (None, 0);
+        let (mut cut, mut compacted, mut folded) = (None, 0, false);
         let (outcome, error, response) = if client.skips(upstream) {
             let var = upstream.server.skip_when_env.as_deref();
             let why = var
@@ -530,6 +618,15 @@ impl ServerHandler for Hub {
             ("skipped", None, Ok(note(text)))
         } else {
             request.name = tool.clone().into();
+            // Where the agent works, unless it named a folder itself (it was not listed).
+            if let Some((argument, folder)) = client.folder_for(upstream) {
+                let arguments = request.arguments.get_or_insert_default();
+                let given = arguments.get(argument);
+                if given.is_none_or(|v| v.is_null() || v.as_str() == Some("")) {
+                    arguments.insert(argument.to_owned(), folder.into());
+                    folded = true;
+                }
+            }
             let session = client.session.as_deref();
             match upstream.call_tool_for(request, session, context.ct).await {
                 Ok(CallToolResponse::Complete(mut result)) => {
@@ -567,6 +664,7 @@ impl ServerHandler for Hub {
                 "structured": structured,
                 "cut": cut,
                 "compacted": (compacted > 0).then_some(compacted),
+                "folder": folded.then_some(true),
             }),
         );
         response
@@ -576,6 +674,23 @@ impl ServerHandler for Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_in_headers() {
+        let path = "/home/me/My Projects/café 100%";
+        let encoded = encode_folder(path.as_bytes());
+        assert_eq!(encoded, "/home/me/My%20Projects/caf%C3%A9%20100%25");
+        let mut headers = hyper::HeaderMap::new();
+        let mut with = |value: &str| {
+            headers.insert(FOLDER_HEADER, value.parse().unwrap());
+            folder(&headers)
+        };
+        assert_eq!(with(&encoded).as_deref(), Some(path));
+        assert_eq!(with("relative/path"), None);
+        assert_eq!(with("/bad%2"), None);
+        assert_eq!(with("/not%FFutf8"), None);
+        assert_eq!(with("/nul%00"), None);
+    }
 
     #[test]
     fn tool_names() {

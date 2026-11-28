@@ -255,6 +255,17 @@ stdio server, see [Local (stdio) servers](#local-stdio-servers)).
   `mcp-hub headers` that look at the variable, so this needs the agent set up
   as in step 2; Codex passes a stdio server only the variables listed in its
   entry, so add `env_vars = ["T3CODE_THREAD_ID"]` to `[mcp_servers.hub]`.
+- `folderArgument`: optional, the name of a parameter in which this server's
+  tools take the folder the agent works in, as `"folderArgument": "cwd"` for
+  `ultrapaint mcp`. MCP's roots, the protocol's old way to say it, are
+  deprecated since 2026-07-28 in favour of a tool parameter, and a server the
+  hub starts once for all agents cannot see their folders. With this the hub
+  fills the parameter in itself, from the working directory of the agent's
+  `mcp-hub connect` (the folder the agent was started in), and leaves it out of
+  the tools it lists: the agent neither reads it in every tool nor writes its
+  path in every call. A call that names a folder itself keeps it. An agent set
+  up with `headers` says no folder, so it gets the parameter listed as the server
+  has it. Subagents share their agent's `connect`, hence its folder.
 
 Then restart the hub and check it:
 
@@ -377,7 +388,8 @@ How it runs:
   stopped in time by the unit's cap.
 - It runs in `cwd` (else the hub's directory), not in the agent's project, and
   agents' MCP roots are not forwarded. Servers meant to work on "the current
-  repo" (filesystem, git) are better configured in each agent directly.
+  repo" (filesystem, git) are better configured in each agent directly, unless
+  they take the folder as a tool parameter: see `folderArgument`.
 - The hub's log says when it starts (with its pid) and when and why it stops.
   Its stderr goes there too, one line per message prefixed with the
   server name. If it fails to start, `mcp-hub status` shows the error line it
@@ -482,8 +494,16 @@ fails and what costs agents context:
 It shows, per tool, the calls, failures, durations and result sizes; the same
 per agent (an agent that was not given a server shows as "without <server>");
 how often each server connected, stopped and why, and failed; and, asked of the
-running hub, how large the tool definitions are and which tools were never
-called.
+running hub as an agent behind `mcp-hub connect` in the current folder gets
+them, what the tools cost an agent's context and which were never called:
+
+- **Up front:** the hub's instructions and the tools' names. Claude Code, Codex
+  and Cursor load MCP tools through a tool search of their own by default: a
+  session starts with only these, whatever the number of tools.
+- **Loaded:** what a model reads of a tool once its agent loads it (its name,
+  description and input schema, as compact JSON; agents leave the output
+  schema and annotations out), per server and for the largest tools. The total
+  is what an agent without tool search carries on every turn.
 
 The record is a file on this machine,
 `~/.local/state/mcp-hub/events.jsonl` (`$XDG_STATE_HOME` is honoured), readable

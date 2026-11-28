@@ -38,6 +38,9 @@ pub struct ServerConfig {
     pub max_result: Option<usize>,
     /// Drop the empty fields (null, "", [], {}) from JSON results.
     pub compact_results: bool,
+    /// The parameter in which this server's tools take the folder the agent works in. The hub
+    /// fills it in from the agent's `mcp-hub connect` and leaves it out of the tools it lists.
+    pub folder_argument: Option<String>,
 }
 
 /// Unless `maxResult` says otherwise: about 10,000 tokens. Agents have limits of their own,
@@ -164,6 +167,7 @@ struct RawServer {
     max_description: Option<usize>,
     max_result: Option<usize>,
     compact_results: Option<bool>,
+    folder_argument: Option<String>,
     description: Option<String>,
     oauth: Option<RawOAuth>,
     bearer: Option<bool>,
@@ -207,6 +211,14 @@ fn valid_secret_env_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// What JSON Schema properties are named in practice, and agents' function calling accepts.
+fn valid_argument_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn parse_stdio(at: &str, s: RawServer, command: String) -> Result<StdioCommand> {
@@ -304,6 +316,14 @@ pub fn parse_config(text: &str) -> Result<Config> {
         let max_result = max_result.filter(|max| *max > 0);
         let compact_results = s.compact_results.take();
         let compact_results = compact_results.or(raw.compact_results).unwrap_or(false);
+        let folder_argument = s.folder_argument.take();
+        if let Some(name) = &folder_argument
+            && !valid_argument_name(name)
+        {
+            bail!(
+                "{at}.folderArgument: expected a parameter name of 1-64 characters of A-Z, a-z, 0-9, _ and -"
+            );
+        }
         let skip_when_env = s.skip_when_env.take();
         if let Some(var) = &skip_when_env
             && !valid_secret_env_name(var)
@@ -371,6 +391,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             max_description,
             max_result,
             compact_results,
+            folder_argument,
         });
     }
     Ok(Config {

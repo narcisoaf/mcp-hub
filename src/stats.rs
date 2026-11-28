@@ -188,9 +188,22 @@ fn agent(event: &Value) -> String {
     }
 }
 
+/// What a model reads of a tool once its agent loads it, in characters: its name,
+/// description and input schema, as compact JSON. Claude Code and Codex leave out the output
+/// schema, annotations and `_meta`; how each frames the rest differs a little.
+pub fn loaded(tool: &Value) -> u64 {
+    let mut read = serde_json::Map::new();
+    for key in ["name", "description", "inputSchema"] {
+        if let Some(value) = tool.get(key) {
+            read.insert(key.to_owned(), value.clone());
+        }
+    }
+    Value::Object(read).to_string().chars().count() as u64
+}
+
 /// Everything `mcp-hub stats` shows, from the events in `dir` and, if the hub answered,
-/// the tools it lists right now.
-pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
+/// the tools it lists right now and its instructions.
+pub fn summary(dir: &Path, days: u64, listed: Option<(&[Value], &str)>) -> Value {
     let events = read(dir, days);
     let mut by_tool: BTreeMap<String, Calls> = BTreeMap::new();
     let mut by_agent: BTreeMap<String, (Calls, u64)> = BTreeMap::new();
@@ -263,18 +276,23 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
         }).collect::<Vec<_>>(),
     });
 
-    if let Some(tools) = tools {
+    if let Some((tools, instructions)) = listed {
         let size = |tool: &Value| tool.to_string().len() as u64;
         let name = |tool: &Value| tool["name"].as_str().unwrap_or("?").to_owned();
-        let mut per_server: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        // In characters, as agents count them: see [`loaded`].
+        let names = |tools: &mut dyn Iterator<Item = &Value>| -> u64 {
+            tools.map(|t| name(t).chars().count() as u64).sum()
+        };
+        let mut per_server: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         for tool in tools {
             let name = name(tool);
             let server = per_server.entry(name.split("__").next().unwrap_or("?").to_owned());
-            let (n, bytes) = server.or_default();
+            let (n, bytes, chars) = server.or_default();
             *n += 1;
             *bytes += size(tool);
+            *chars += loaded(tool);
         }
-        let mut largest: Vec<_> = tools.iter().map(|t| (size(t), name(t))).collect();
+        let mut largest: Vec<_> = tools.iter().map(|t| (loaded(t), name(t))).collect();
         largest.sort_unstable_by(|a, b| b.cmp(a));
         let unused: Vec<_> = tools
             .iter()
@@ -284,11 +302,16 @@ pub fn summary(dir: &Path, days: u64, tools: Option<&[Value]>) -> Value {
         summary["definitions"] = json!({
             "tools": tools.len(),
             "bytes": tools.iter().map(size).sum::<u64>(),
-            "servers": per_server.iter().map(|(server, (n, bytes))| {
-                json!({"server": server, "tools": n, "bytes": bytes})
+            "loadedChars": tools.iter().map(loaded).sum::<u64>(),
+            "upFront": {
+                "instructionsChars": instructions.chars().count(),
+                "nameChars": names(&mut tools.iter()),
+            },
+            "servers": per_server.iter().map(|(server, (n, bytes, chars))| {
+                json!({"server": server, "tools": n, "bytes": bytes, "loadedChars": chars})
             }).collect::<Vec<_>>(),
-            "largest": largest.iter().take(8).map(|(bytes, name)| {
-                json!({"tool": name, "bytes": bytes})
+            "largest": largest.iter().take(8).map(|(chars, name)| {
+                json!({"tool": name, "loadedChars": chars})
             }).collect::<Vec<_>>(),
             "neverCalled": unused,
         });
@@ -412,21 +435,37 @@ pub fn render(s: &Value, all: bool) -> String {
     }
     let d = &s["definitions"];
     if d.is_object() {
+        let up = &d["upFront"];
+        let up_front = n(&up["instructionsChars"]) + n(&up["nameChars"]);
         let _ = writeln!(
             out,
-            "\n{} {} tools, {} bytes (about {} tokens if all were loaded)",
+            "\n{} {} tools",
             p.bold("Tool definitions now:"),
             n(&d["tools"]),
-            short(&d["bytes"]),
-            short(&json!(d["bytes"].as_u64().unwrap_or(0) / 4)),
         );
+        let _ = writeln!(
+            out,
+            "Up front, with tool search (Claude Code, Codex, Cursor): {} characters, about {} tokens \
+             (instructions {}, names {})",
+            short(&json!(up_front)),
+            short(&json!(up_front / 4)),
+            short(&up["instructionsChars"]),
+            short(&up["nameChars"]),
+        );
+        let _ = writeln!(
+            out,
+            "Loaded: {} characters, about {} tokens, if an agent loads every tool (without tool search)",
+            short(&d["loadedChars"]),
+            short(&json!(n(&d["loadedChars"]) / 4)),
+        );
+        let _ = writeln!(out, "{:<16}{:>10}{:>10}", "", "tools", "loaded");
         for server in list(&d["servers"]) {
             let name = server["server"].as_str().unwrap_or("?");
             let _ = writeln!(
                 out,
-                "{name:<16}{:>4} tools{:>8}",
+                "{name:<16}{:>10}{:>10}",
                 n(&server["tools"]),
-                short(&server["bytes"])
+                short(&server["loadedChars"])
             );
         }
         let cut = &s["descriptionsCut"];
@@ -438,10 +477,10 @@ pub fn render(s: &Value, all: bool) -> String {
                 short(&cut["bytesSaved"]),
             );
         }
-        let _ = writeln!(out, "{}", p.bold("Largest:"));
+        let _ = writeln!(out, "{}", p.bold("Largest, loaded:"));
         for tool in list(&d["largest"]) {
             let name = tool["tool"].as_str().unwrap_or("?");
-            let _ = writeln!(out, "{:>8}  {name}", short(&tool["bytes"]));
+            let _ = writeln!(out, "{:>8}  {name}", short(&tool["loadedChars"]));
         }
         let unused = list(&d["neverCalled"]);
         let _ = write!(
@@ -465,26 +504,42 @@ pub fn render(s: &Value, all: bool) -> String {
     out
 }
 
-/// Ask the hub on `port` for the tools it lists.
-pub async fn listed_tools(port: u16, token: &str) -> Result<Vec<Value>> {
+/// Ask the hub on `port` for the tools it lists and its instructions, as an agent set up with
+/// `mcp-hub connect` in this folder gets them.
+pub async fn listed_tools(port: u16, token: &str) -> Result<(Vec<Value>, String)> {
+    use std::os::unix::ffi::OsStrExt;
     let http = reqwest::Client::builder().no_proxy().build()?;
-    let response = http
-        .post(format!("http://127.0.0.1:{port}/mcp"))
-        .timeout(Duration::from_secs(30))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header(
-            "User-Agent",
-            concat!("mcp-hub-stats/", env!("CARGO_PKG_VERSION")),
-        )
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-        .send()
-        .await?
-        .error_for_status()?;
-    let mut answer: Value = serde_json::from_slice(&response.bytes().await?)?;
+    let folder = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let folder = crate::hub::encode_folder(folder.as_os_str().as_bytes());
+    let ask = async |body: &str| -> Result<Value> {
+        let response = http
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .timeout(Duration::from_secs(30))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(
+                "User-Agent",
+                concat!("mcp-hub-stats/", env!("CARGO_PKG_VERSION")),
+            )
+            .header(crate::hub::FOLDER_HEADER, &folder)
+            .body(body.to_owned())
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(serde_json::from_slice(&response.bytes().await?)?)
+    };
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp-hub-stats","version":"0"}}}"#;
+    let instructions = match ask(initialize).await {
+        Ok(answer) => answer["result"]["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        Err(_) => String::new(),
+    };
+    let mut answer = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await?;
     match answer["result"]["tools"].take() {
-        Value::Array(tools) => Ok(tools),
+        Value::Array(tools) => Ok((tools, instructions)),
         _ => anyhow::bail!("unexpected answer to tools/list"),
     }
 }
@@ -511,8 +566,12 @@ mod tests {
         stats.record("tools", listed);
         Stats::off().record("call", call("c", 1, "ok", 1));
 
-        let tools = [json!({"name": "s__a"}), json!({"name": "s__z"})];
-        let s = summary(&dir, 7, Some(&tools));
+        let tools = [
+            json!({"name": "s__a", "description": "Does a.", "inputSchema": {"type": "object"},
+                   "outputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}}),
+            json!({"name": "s__z", "inputSchema": {"type": "object"}}),
+        ];
+        let s = summary(&dir, 7, Some((&tools, "Tools from s.")));
         assert_eq!(s["total"]["calls"], 3);
         assert_eq!(s["total"]["failed"], 1);
         assert_eq!(s["tools"][0]["tool"], "s__a");
@@ -527,6 +586,14 @@ mod tests {
             json!({"tools": 2, "bytesSaved": 4100})
         );
         assert_eq!(s["definitions"]["neverCalled"], json!(["s__z"]));
+        // What a model reads: no output schema, no annotations.
+        let a = r#"{"name":"s__a","description":"Does a.","inputSchema":{"type":"object"}}"#;
+        let z = r#"{"name":"s__z","inputSchema":{"type":"object"}}"#;
+        assert_eq!(s["definitions"]["loadedChars"], (a.len() + z.len()) as u64);
+        assert_eq!(
+            s["definitions"]["upFront"],
+            json!({"instructionsChars": 13, "nameChars": 8})
+        );
         let text = render(&s, false);
         assert!(text.contains("3 tool calls (1 failed)"), "{text}");
         assert!(

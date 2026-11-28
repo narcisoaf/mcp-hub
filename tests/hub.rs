@@ -36,6 +36,8 @@ struct Fake {
     list_delay: Duration,
     /// Also list "wordy", a tool that says far too much about itself.
     wordy: bool,
+    /// Also list tools that take the agent's folder as `cwd`, as Ultrapaint's relay does.
+    folder: bool,
 }
 
 /// What "wordy" has to say: `about` it, over and over, and how it ends.
@@ -63,6 +65,27 @@ impl ServerHandler for Fake {
                 .unwrap()
         });
         let mut tools = tools.to_vec();
+        if self.folder {
+            let tool =
+                |name, schema| serde_json::from_value(json!({"name": name, "inputSchema": schema}));
+            tools.push(
+                tool(
+                    "where",
+                    json!({"type": "object",
+                "properties": {"x": {"type": "number"}, "cwd": {"type": "string"}},
+                "required": ["x", "cwd"]}),
+                )
+                .unwrap(),
+            );
+            tools.push(
+                tool(
+                    "bare",
+                    json!({"type": "object", "additionalProperties": false,
+                "properties": {"cwd": {"type": "string"}}, "required": ["cwd"]}),
+                )
+                .unwrap(),
+            );
+        }
         if self.wordy {
             let wordy = json!({
                 "name": "wordy",
@@ -448,6 +471,90 @@ async fn leaves_out_a_skipped_server() {
         "{text}"
     );
     client.cancel().await.unwrap();
+}
+
+/// A server with `folderArgument` gets the folder of the agent's `mcp-hub connect` in each
+/// call, and the agent does not see the parameter; an agent that says no folder still does.
+#[tokio::test]
+async fn gives_the_agents_folder() {
+    let fake = Fake {
+        folder: true,
+        ..Fake::default()
+    };
+    let config = parse_config(
+        &json!({"servers": {
+            "fake": {"url": format!("http://127.0.0.1:{}/mcp", start_fake(fake).await), "folderArgument": "cwd"},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let store = SecretStore::memory();
+    store.set(mcp_hub::TOKEN_KEY, TOKEN).await.unwrap();
+    let upstreams = config
+        .servers
+        .iter()
+        .map(|s| Upstream::new(s.clone(), store.clone()));
+    let hub = Hub::new(upstreams.collect());
+    let listener = http::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { http::serve(listener, hub, TOKEN, CancellationToken::new()).await });
+
+    let (agent, bridge) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(bridge);
+    tokio::spawn(mcp_hub::connect::run(
+        port,
+        store,
+        Vec::new(),
+        input,
+        output,
+    ));
+    let client = mcp_hub::upstream::client_info().serve(agent).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    let schema = |name: &str| {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        serde_json::Value::Object((*tool.input_schema).clone())
+    };
+    assert_eq!(
+        schema("fake__where"),
+        json!({"type": "object", "properties": {"x": {"type": "number"}}, "required": ["x"]})
+    );
+    // Nothing left but the folder: as the server had it before a relay added the parameter.
+    assert_eq!(
+        schema("fake__bare"),
+        json!({"type": "object", "additionalProperties": false})
+    );
+    assert_eq!(schema("fake__echo"), json!({"type": "object"}));
+
+    let here = std::env::current_dir().unwrap();
+    let call = async |arguments: serde_json::Value| {
+        let mut params = CallToolRequestParams::new("fake__where");
+        params.arguments = arguments.as_object().cloned();
+        let result = client.call_tool(params).await.unwrap();
+        result.content[0].as_text().unwrap().text.clone()
+    };
+    let expected = json!({"x": 1, "cwd": here.to_str().unwrap()});
+    assert_eq!(call(json!({"x": 1})).await, format!("where:{expected}"));
+    // A folder the agent names itself is its own.
+    let named = json!({"x": 1, "cwd": "/somewhere/else"});
+    assert_eq!(call(named.clone()).await, format!("where:{named}"));
+    client.cancel().await.unwrap();
+
+    // Without the header (an agent set up with `headers`) the parameter is listed as it came.
+    let answer: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tools = answer["result"]["tools"].as_array().unwrap();
+    let bare = tools.iter().find(|t| t["name"] == "fake__bare").unwrap();
+    assert_eq!(bare["inputSchema"]["required"], json!(["cwd"]));
 }
 
 /// Calls, lists and what the upstreams did end up in the record, without their content.

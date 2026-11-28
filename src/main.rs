@@ -345,7 +345,10 @@ async fn show_stats(config: Config, store: SecretStore, options: &[String]) -> R
         Ok(Some(token)) => stats::listed_tools(config.port, &token).await.ok(),
         _ => None,
     };
-    let summary = stats::summary(&stats::state_dir(), days, tools.as_deref());
+    let listed = tools
+        .as_ref()
+        .map(|(tools, text)| (&tools[..], text.as_str()));
+    let summary = stats::summary(&stats::state_dir(), days, listed);
     if as_json {
         println!("{summary}");
     } else {
